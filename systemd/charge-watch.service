@@ -1,0 +1,11 @@
+[Unit]
+Description=charge-watch: warn when the headset is plugged in but not charging
+After=pipewire.service
+
+[Service]
+ExecStart=%h/.local/bin/charge-watch run
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

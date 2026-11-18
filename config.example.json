@@ -1,0 +1,13 @@
+{
+  "shutdown_at": 0,
+  "volume_floor": 0.8,
+  "beeps": 3,
+  "repeat": 60,
+  "push": {
+    "ntfy": "",
+    "pushover_user": "",
+    "pushover_token": "",
+    "discord": "",
+    "webhook": ""
+  }
+}

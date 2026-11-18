@@ -1,0 +1,4 @@
+manifest: 0
+provides: [tooling]
+runs_on: headset
+install: "git clone https://github.com/frame-commons/charge-watch && cd charge-watch && ./install.sh"
