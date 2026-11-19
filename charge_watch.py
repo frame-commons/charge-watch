@@ -212,7 +212,7 @@ def merge_sysfs(s, sysfs):
 DEFAULTS = {"drop": 2, "window": 600, "hold": 60, "drain_hold": 90, "slow_hold": 120, "repeat": 60,
             "repeat_low": 30, "low": 15, "hot": 42.0, "full": 95,
             "volume_floor": 0.8, "beeps": 3, "push_repeat": 600,
-            "shutdown_at": None, "shutdown_hold": 60, "countdown": 60}
+            "shutdown_at": None, "shutdown_hold": 60, "countdown": 60, "voice": "auto"}
 
 MESSAGES = {
     "stuck": "Power warning. Plugged in, but the charger is stuck and taking no power. "
@@ -493,10 +493,106 @@ def find_player():
     return None
 
 
-def find_speaker():
-    for p in ("spd-say", "espeak-ng", "espeak"):
-        if shutil.which(p):
+# ---------- speech ----------
+# Spoken lines, one per alert kind. The bundled clips in voice/ are these lines, made by tools/make-voice.py with
+# espeak-ng (a rule-based synthesizer: no neural voice, no network). Drop your own <kind>.wav in
+# ~/.config/charge-watch/voice/ to replace any of them, your own voice for example.
+SPOKEN = {
+    "stuck": MESSAGES["stuck"], "no-input": MESSAGES["no-input"], "cant-keep-up": MESSAGES["cant-keep-up"],
+    "discharge": MESSAGES["discharge"], "draining": MESSAGES["draining"], "slow": MESSAGES["slow"], "ok": MESSAGES["ok"],
+    "shutdown-warn": "Battery low and not charging. Shutting down soon to protect the battery. "
+                     "Plug into a charger that works to cancel.",
+    "shutdown-cancel": MESSAGES["shutdown-cancel"], "poweroff": MESSAGES["poweroff"],
+    "poweroff-failed": MESSAGES["poweroff-failed"], "test": "This is a charge-watch test.",
+}
+VOICE_MODES = ("auto", "tts", "off")
+
+
+def voice_dirs():
+    cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return [os.path.join(cfg, "charge-watch", "voice"),            # your own recordings win
+            os.path.join(data, "charge-watch", "voice"),           # what install.sh copied
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), "voice")]   # running from the checkout
+
+
+def clip_for(kind):
+    for d in voice_dirs():
+        p = os.path.join(d, kind + ".wav")
+        if os.path.isfile(p):
             return p
+    return None
+
+
+_TTS = {}
+
+
+def working_tts():
+    """A text-to-speech engine that really speaks, or None. Being installed is not enough: SteamOS on the Frame
+    ships spd-say, but its only working module is 'dummy', which plays a recording saying speech isn't set up
+    (issue #1). So espeak-ng counts only if it writes real audio, and spd-say only with a module besides dummy.
+    Returns ("file", exe) to synthesize a WAV and play it ourselves, or ("spd-say",)."""
+    if "v" in _TTS:
+        return _TTS["v"]
+    v = None
+    for exe in ("espeak-ng", "espeak"):
+        if shutil.which(exe):
+            try:
+                r = subprocess.run([exe, "--stdout", "test"], capture_output=True, timeout=10)
+                if r.returncode == 0 and r.stdout[:4] == b"RIFF" and len(r.stdout) > 2000:
+                    v = ("file", exe); break
+            except (OSError, subprocess.SubprocessError):
+                pass
+    if v is None and shutil.which("spd-say"):
+        try:
+            out = subprocess.run(["spd-say", "-O"], capture_output=True, text=True, timeout=10).stdout
+            mods = [l.strip() for l in out.splitlines() if l.strip() and l.strip() != "OUTPUT MODULES"]
+            if any(m != "dummy" for m in mods):
+                v = ("spd-say",)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _TTS["v"] = v
+    return v
+
+
+def speech_path(voice="auto", say_cmd=None):
+    """What `speak` would use, for status: 'your --say-cmd', 'bundled clips', 'espeak-ng', 'spd-say' or 'none'."""
+    if voice == "off":
+        return "off"
+    if say_cmd:
+        return "your say_cmd"
+    if voice == "auto" and clip_for("stuck") and find_player():
+        return "voice clips (" + os.path.dirname(clip_for("stuck")) + ")"
+    t = working_tts()
+    return (t[1] if t[0] == "file" else "spd-say") if t else "none (no clips found, no working text-to-speech)"
+
+
+def speak(kinds, text, say_cmd=None, voice="auto"):
+    """Say it: your say_cmd, else the clips for `kinds` (voice auto), else a text-to-speech engine that works.
+    Returns what it used, or None."""
+    if voice == "off":
+        return None
+    if say_cmd:
+        _run_quiet(say_cmd + [text], 30)
+        return "say_cmd"
+    player = find_player()
+    clips = [clip_for(k) for k in kinds]
+    if voice == "auto" and player and clips and all(clips):
+        for c in clips:
+            _run_quiet([player, c], 30)
+        return "clips"
+    t = working_tts()
+    if t and t[0] == "file" and player:
+        fd, wav = tempfile.mkstemp(suffix=".wav"); os.close(fd)
+        try:
+            _run_quiet([t[1], "-w", wav, text], 30)
+            _run_quiet([player, wav], 30)
+        finally:
+            os.unlink(wav)
+        return t[1]
+    if t and t[0] == "spd-say":
+        _run_quiet(["spd-say", "-w", text], 30)
+        return "spd-say"
     return None
 
 
@@ -511,7 +607,8 @@ def message(kind, opts=None):
     return MESSAGES[kind].format(countdown=(opts or {}).get("countdown", DEFAULTS["countdown"]))
 
 
-def alert(kind, mode="auto", say_cmd=None, volume_floor=DEFAULTS["volume_floor"], beeps=DEFAULTS["beeps"], text=None):
+def alert(kind, mode="auto", say_cmd=None, volume_floor=DEFAULTS["volume_floor"], beeps=DEFAULTS["beeps"], text=None,
+          voice="auto", spoken=None):
     """The alarm (loud: see Loud), a desktop notification where one is shown, and speech if a speech command
     exists. mode: auto | chime | speech | print. Never raises."""
     msg = text or message(kind)
@@ -534,11 +631,7 @@ def alert(kind, mode="auto", say_cmd=None, volume_floor=DEFAULTS["volume_floor"]
                     _run_quiet(["notify-send", "-a", "charge-watch", "-u", "normal" if calm else "critical",
                                 "Steam Frame: " + TITLES.get(kind, kind), msg], 10)
             if mode in ("auto", "speech"):
-                sp = say_cmd or ([find_speaker()] if find_speaker() else None)
-                if sp == ["spd-say"]:
-                    sp = ["spd-say", "-w"]
-                if sp:
-                    _run_quiet(sp + [msg], 30)
+                speak(spoken or [kind], msg, say_cmd, voice)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"charge-watch: alert failed: {e}", file=sys.stderr)
 
@@ -715,7 +808,7 @@ class JournalFollower:
 # ---------- commands ----------
 
 SETTINGS = {"repeat": int, "repeat_low": int, "volume_floor": float, "beeps": int, "push_repeat": int,
-            "shutdown_at": int, "countdown": int, "shutdown_hold": int, "alert": str, "say_cmd": str}
+            "shutdown_at": int, "countdown": int, "shutdown_hold": int, "alert": str, "say_cmd": str, "voice": str}
 ALERT_MODES = ("auto", "chime", "speech", "print")
 
 
@@ -748,6 +841,9 @@ def settings(a, cfg):
         if o["alert"] is not None:
             _warn(f"ignoring alert={o['alert']!r}; using auto")
         o["alert"] = "auto"
+    if o["voice"] not in VOICE_MODES:
+        _warn(f"ignoring voice={o['voice']!r} (want auto, tts or off); using auto")
+        o["voice"] = "auto"
     o["volume_floor"] = min(float(o["volume_floor"]), 1.0)
     o["beeps"] = max(1, min(o["beeps"], 10))
     o["repeat"], o["repeat_low"] = max(10, o["repeat"]), max(10, o["repeat_low"])
@@ -764,7 +860,7 @@ def describe_settings(o, cfg):
     return (f"repeat {o['repeat']} s ({o['repeat_low']} s at {DEFAULTS['low']} % or below), "
             f"volume floor {o['volume_floor']}, beeps {o['beeps']}, "
             f"auto-shutdown {'at ' + str(o['shutdown_at']) + ' %' if o['shutdown_at'] else 'off'}, "
-            f"push {', '.join(sv) if sv else 'off'}")
+            f"push {', '.join(sv) if sv else 'off'}, speech: {speech_path(o['voice'], _say(o))}")
 
 
 def watchers(a, o):
@@ -843,7 +939,7 @@ def cmd_status(a):
     act = Rules(hold=0, drain_hold=0, slow_hold=0).step(s) if p else []
     r = {"source": s.get("src"), "sample": s, "plugged": bool(p), "verdict": act or ["ok"],
          "messages": [MESSAGES[k] for k in act], "note": note,
-         "settings": {**{k: o[k] for k in SETTINGS}, "push": push_services(cfg)}}
+         "settings": {**{k: o[k] for k in SETTINGS}, "push": push_services(cfg), "speech": speech_path(o["voice"], _say(o))}}
     if a.json:
         print(json.dumps(r))
     else:
@@ -863,7 +959,7 @@ def cmd_test_alert(a):
     cfg = load_config(a.config)
     o = settings(a, cfg)
     alert("no-input", o["alert"], _say(o), o["volume_floor"], o["beeps"],
-          text="This is a charge-watch test. " + MESSAGES["no-input"])
+          text="This is a charge-watch test. " + MESSAGES["no-input"], voice=o["voice"], spoken=["test", "no-input"])
     if a.push:
         if not push_services(cfg):
             print(f"charge-watch: no push service set up in {a.config or CONFIG}", file=sys.stderr)
@@ -877,8 +973,9 @@ def cmd_test_alert(a):
 def cmd_test_shutdown(a):
     cfg = load_config(a.config)
     o = settings(a, cfg)
-    alert("shutdown-warn", o["alert"], _say(o), o["volume_floor"], o["beeps"], text=message("shutdown-warn", o))
-    alert("poweroff", o["alert"], _say(o), o["volume_floor"], 1)
+    alert("shutdown-warn", o["alert"], _say(o), o["volume_floor"], o["beeps"], text=message("shutdown-warn", o),
+          voice=o["voice"])
+    alert("poweroff", o["alert"], _say(o), o["volume_floor"], 1, voice=o["voice"])
     c = poweroff_command()
     print("test only, nothing powered off. It would run: " + (" ".join(c) if c else "(no power-off command found)"))
     print("auto-shutdown is " + (f"ON at {o['shutdown_at']} %" if o["shutdown_at"] else
@@ -907,7 +1004,7 @@ def cmd_run(a):
         if push_services(cfg) and gate.allow(s["t"], k):
             th = threading.Thread(target=push, args=(k, text, cfg, s.get("soc")), daemon=True)
             th.start()
-        alert(k, o["alert"], _say(o), o["volume_floor"], 1 if k == "poweroff" else o["beeps"], text=text)
+        alert(k, o["alert"], _say(o), o["volume_floor"], 1 if k == "poweroff" else o["beeps"], text=text, voice=o["voice"])
         return th
 
     def handle(s):
@@ -976,7 +1073,9 @@ def main(argv=None):
 
     def alert_args(sp):
         sp.add_argument("--alert", choices=["auto", "chime", "speech", "print"])
-        sp.add_argument("--say-cmd", help="speech command to use instead of spd-say/espeak-ng, e.g. 'piper-say'")
+        sp.add_argument("--say-cmd", help="your own speech command, given the text as its last argument (e.g. a Piper wrapper)")
+        sp.add_argument("--voice", choices=VOICE_MODES, help="auto: the voice clips, else a text-to-speech engine that "
+                                                              "works (default); tts: skip the clips; off: no speech")
         sp.add_argument("--volume-floor", type=float, metavar="0-1",
                         help=f"raise the volume to at least this for an alarm (default {DEFAULTS['volume_floor']}; 0 = never)")
         sp.add_argument("--beeps", type=int, help=f"alarm repeats per warning (default {DEFAULTS['beeps']})")

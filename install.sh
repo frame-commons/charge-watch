@@ -6,9 +6,11 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin="$HOME/.local/bin/charge-watch"
 unit="$HOME/.config/systemd/user/charge-watch.service"
+voice="${XDG_DATA_HOME:-$HOME/.local/share}/charge-watch/voice"
 if [ "${1:-}" = "--remove" ]; then
     systemctl --user disable --now charge-watch.service 2>/dev/null || true
     rm -f "$bin" "$unit"
+    rm -rf "$voice"
     systemctl --user daemon-reload
     echo "charge-watch removed (its settings stay in ~/.config/charge-watch/, its log in ~/.local/state/charge-watch/)"
     exit 0
@@ -16,6 +18,10 @@ fi
 mkdir -p "$HOME/.local/bin" "$HOME/.config/systemd/user"
 install -m 755 "$here/charge_watch.py" "$bin"
 install -m 644 "$here/systemd/charge-watch.service" "$unit"
+if ls "$here"/voice/*.wav >/dev/null 2>&1; then   # voice clips, if this checkout has them (tools/make-voice.py)
+    mkdir -p "$voice"
+    install -m 644 "$here"/voice/*.wav "$voice"/  # your own in ~/.config/charge-watch/voice/ still win
+fi
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/charge-watch/config.json"
 if [ ! -e "$conf" ]; then
     mkdir -p "$(dirname "$conf")"

@@ -3,6 +3,7 @@
   "volume_floor": 0.8,
   "beeps": 3,
   "repeat": 60,
+  "voice": "auto",
   "push": {
     "ntfy": "",
     "pushover_user": "",

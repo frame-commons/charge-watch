@@ -571,5 +571,91 @@ class Sigterm(unittest.TestCase):
             self.assertEqual(calls[-2:], ["set-volume 0.30", "set-mute 1"])
 
 
+class Speech(unittest.TestCase):
+    """Issue #1: SteamOS on the Frame ships spd-say whose only working module is 'dummy', which plays a recording
+    saying speech isn't set up. Being installed must not count as working; the bundled clips speak instead."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.log = os.path.join(self.d, "calls")
+        self.old = {k: os.environ.get(k) for k in ("PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME")}
+        os.environ.update(PATH=self.d, XDG_CONFIG_HOME=os.path.join(self.d, "cfg"), XDG_DATA_HOME=os.path.join(self.d, "data"))
+        cw._TTS.clear()
+
+    def tearDown(self):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        cw._TTS.clear()
+
+    def stub(self, name, body):
+        return _stub(self.d, name, f'echo "{name} $*" >> "{self.log}"\n' + body)
+
+    def calls(self):
+        try:
+            with open(self.log) as f:
+                return f.read().splitlines()
+        except OSError:
+            return []
+
+    def test_every_spoken_line_has_a_clip(self):
+        repo_voice = os.path.join(os.path.dirname(HERE), "voice")
+        if not os.path.isdir(repo_voice):
+            self.skipTest("no voice/ in this checkout (made by tools/make-voice.py)")
+        for kind in cw.SPOKEN:
+            p = os.path.join(repo_voice, kind + ".wav")
+            self.assertTrue(os.path.isfile(p), kind)
+            with wave.open(p) as w:
+                self.assertEqual((w.getframerate(), w.getnchannels()), (16000, 1), kind)
+                self.assertGreater(w.getnframes(), 8000, kind)
+        for kind in cw.MESSAGES:
+            self.assertIn(kind, cw.SPOKEN)
+
+    def test_dummy_only_spd_say_is_not_speech(self):
+        self.stub("spd-say", 'case "$1" in -O) printf "OUTPUT MODULES\\ndummy\\n";; esac')
+        self.assertIsNone(cw.working_tts())
+        self.stub("pw-play", "")
+        self.assertIsNone(cw.speak(["stuck"], "x", voice="tts"))       # no clips allowed, no engine: silent
+        self.assertFalse([c for c in self.calls() if c.startswith("spd-say -w")])
+
+    def test_issue_1_case_speaks_the_clips(self):
+        self.stub("spd-say", 'case "$1" in -O) printf "OUTPUT MODULES\\ndummy\\n";; esac')
+        self.stub("pw-play", "")
+        mine = os.path.join(self.d, "cfg", "charge-watch", "voice")
+        os.makedirs(mine)
+        for k in ("test", "no-input"):
+            cw.chime_wav(os.path.join(mine, k + ".wav"), "ok")
+        self.assertEqual(cw.speak(["test", "no-input"], "x"), "clips")
+        played = [c for c in self.calls() if c.startswith("pw-play")]
+        self.assertEqual([os.path.basename(c.split()[-1]) for c in played], ["test.wav", "no-input.wav"])
+        self.assertFalse([c for c in self.calls() if c.startswith("spd-say -w")])
+
+    def test_spd_say_with_a_real_module_counts(self):
+        self.stub("spd-say", 'case "$1" in -O) printf "OUTPUT MODULES\\nespeak-ng\\ndummy\\n";; esac')
+        self.assertEqual(cw.working_tts(), ("spd-say",))
+
+    def test_espeak_ng_counts_only_if_it_writes_audio(self):
+        self.stub("espeak-ng", 'exit 1')
+        self.assertIsNone(cw.working_tts())
+        cw._TTS.clear()
+        self.stub("espeak-ng", 'printf "RIFF"; /usr/bin/head -c 4000 /dev/zero')
+        self.assertEqual(cw.working_tts(), ("file", "espeak-ng"))
+
+    def test_your_own_recording_wins(self):
+        mine = os.path.join(self.d, "cfg", "charge-watch", "voice")
+        os.makedirs(mine)
+        with open(os.path.join(mine, "stuck.wav"), "wb") as f:
+            f.write(b"RIFF")
+        self.assertEqual(cw.clip_for("stuck"), os.path.join(mine, "stuck.wav"))
+        self.assertIsNone(cw.clip_for("no-such-line"))
+
+    def test_voice_off(self):
+        self.stub("pw-play", "")
+        self.assertIsNone(cw.speak(["stuck"], "x", voice="off"))
+        self.assertEqual(self.calls(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
