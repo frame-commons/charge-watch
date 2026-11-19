@@ -1,0 +1,41 @@
+name: Charging report
+description: Share a charge-watch report, so your case can be compared with others.
+title: "Report: "
+labels: ["report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. Your report helps everyone with a Frame that won't charge.
+
+        1. On the headset, in a terminal: `./charge_watch.py report` (add `--sleep-test` for the sleep test). It asks a few questions and writes `charge-watch-report-….txt` in your home folder.
+        2. **Read the file.** It has charging values and charging-related log lines. Serial numbers, the hostname, the user name, and MAC and IP addresses are removed. Delete anything else you don't want public.
+        3. Drag the file into the box below.
+
+        Nothing is sent automatically, by this form or by charge-watch.
+  - type: textarea
+    id: report
+    attributes:
+      label: The report file
+      description: Drag `charge-watch-report-….txt` here (or paste its contents).
+    validations:
+      required: true
+  - type: input
+    id: charger
+    attributes:
+      label: Charger and cable
+      placeholder: "e.g. Valve 45 W charger, its own cable"
+  - type: textarea
+    id: story
+    attributes:
+      label: What happens, in your words
+      placeholder: "e.g. charges when off, not when on; died overnight on the charger; fine with one charger, not another"
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: What you've tried
+      options:
+        - label: Another cable
+        - label: Another charger
+        - label: Charging while off or asleep
+        - label: A Valve support ticket (if so, what did they say? Add it above)

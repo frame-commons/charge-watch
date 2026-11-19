@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Tests on synthetic journals and sysfs trees (tests/fixtures.py). Run: python3 -m unittest discover tests"""
-import contextlib, io, json, os, sys, tempfile, unittest, wave
+import contextlib, io, json, os, sys, tempfile, unittest, unittest.mock, wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
@@ -655,6 +655,189 @@ class Speech(unittest.TestCase):
         self.stub("pw-play", "")
         self.assertIsNone(cw.speak(["stuck"], "x", voice="off"))
         self.assertEqual(self.calls(), [])
+
+
+class Report(unittest.TestCase):
+    """charge-watch report: a scripted person answers the prompts and changes the fake headset as told."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="cw-report-")
+        self.root = os.path.join(self.d, "root")
+        bin_ = os.path.join(self.d, "bin"); os.makedirs(bin_)
+        host = cw.socket.gethostname()
+        lines = [json.dumps({"__REALTIME_TIMESTAMP": "1763500000000000", "MESSAGE": m}) for m in (
+            f"tcpm-source-psy-0: {host} attached, from 203.0.113.20 aa:bb:cc:dd:ee:ff",
+            "wifi: roamed", "pm8550b-charger: QPH2 entered")]
+        with open(os.path.join(bin_, "journalctl"), "w") as f:
+            f.write("#!/bin/sh\ncat <<'X'\n" + "\n".join(lines) + "\nX\n")
+        os.chmod(os.path.join(bin_, "journalctl"), 0o755)
+        self.env = unittest.mock.patch.dict(os.environ, {"PATH": bin_ + os.pathsep + os.environ["PATH"]})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def person(self, plugged, unplugged=None, asleep=None, answers=None):
+        """ask(): answers prompts and rebuilds the tree: `unplugged` after 'Unplug', `plugged` after 'Plug it back',
+        `asleep` (the state after waking) after the sleep prompt."""
+        ans = dict({"Is a charger": "y", "Which charger": "Test 45 W, its cable", "Optional sleep": "n"}, **(answers or {}))
+        self.clock = [0.0]; self.nap = [0.0]
+
+        def ask(prompt):
+            for k, v in ans.items():
+                if prompt.startswith(k):
+                    return v
+            if prompt.startswith("Unplug"):
+                fx.headset(self.root, **(unplugged or dict(online=0, partner=False, bat_ua=-420_000)))
+            elif prompt.startswith("Plug it back"):
+                fx.headset(self.root, **plugged)
+            elif prompt.startswith("Keep the charger"):
+                fx.headset(self.root, **asleep); self.nap[0] += 1800
+            return ""
+        return ask
+
+    def run_report(self, ask, **kw):
+        clock = lambda: self.clock.__setitem__(0, self.clock[0] + 10) or self.clock[0]   # noqa: E731
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            path = cw.run_report(root=self.root, ask=ask, out_dir=self.d, watch_s=30, sleep_wait_s=60, awake_s=0,
+                                 poll=0, clock=clock, slept=lambda: self.nap[0], **kw)
+        with open(path) as f:
+            return f.read(), out.getvalue()
+
+    def pattern(self, text):
+        return json.loads(text.split("charge-watch-summary ", 1)[1].splitlines()[0])["pattern"]
+
+    def test_tester_case_never_seen_awake_but_charges_asleep(self):
+        """issue-reporter's Frame: plugged in, the OS sees nothing; asleep it gains charge."""
+        dead = dict(online=0, partner=False, contract_v=None, bat_ua=-420_000, soc=54, charge_uah=2_100_000)
+        fx.headset(self.root, **dead)
+        ask = self.person(plugged=dead, asleep=dict(dead, soc=60, charge_uah=2_350_000),
+                          answers={"Optional sleep": "y"})
+        text, said = self.run_report(ask)
+        self.assertEqual(self.pattern(text), "not-detected-but-charges-asleep")
+        self.assertIn("+6 % (+250 mAh) in 30 min asleep", text)
+        self.assertIn("does not detect the charger at all", text)          # the Valve paragraph
+        self.assertIn("Test 45 W, its cable", text)
+        self.assertIn("Result: The headset doesn't see the charger while it's on", said)
+
+    def test_qph2_stuck(self):
+        stuck = dict(detail={"Input OK": 0, "QPH2": 1}, bat_ua=-300_000)
+        fx.headset(self.root, **stuck)
+        text, _ = self.run_report(self.person(plugged=stuck))
+        self.assertEqual(self.pattern(text), "qph2-stuck")
+        self.assertIn("#2879", text)
+
+    def test_pd_offered_but_5v_agreed(self):
+        five = dict(contract_v=5.0, bat_ua=100_000)
+        fx.headset(self.root, **five)
+        text, _ = self.run_report(self.person(plugged=five))
+        self.assertEqual(self.pattern(text), "pd-not-negotiated")
+        self.assertIn("5 V 3 A, 9 V 3 A, 15 V 3 A", text)
+
+    def test_charging_normally_and_what_changed(self):
+        fx.headset(self.root)
+        text, _ = self.run_report(self.person(plugged={}))
+        self.assertEqual(self.pattern(text), "charging")
+        self.assertIn("== Values: changed when unplugged ==", text)
+        self.assertIn("tcpm-source-psy-0/online = 0", text)
+
+    def test_full_battery_on_the_charger_is_fine(self):
+        fx.headset(self.root, soc=100, bat_ua=0)
+        with open(os.path.join(self.root, "sys/class/power_supply/max1720x_bat_0-00/status"), "w") as f:
+            f.write("Not charging\n")
+        text, _ = self.run_report(None, guided=False)
+        self.assertEqual(self.pattern(text), "charging")
+
+    def test_quick_unplugged(self):
+        fx.headset(self.root, online=0, partner=False, contract_v=None, bat_ua=-400_000)
+        text, said = self.run_report(lambda p: self.fail("--quick asked: " + p), guided=False)
+        self.assertEqual(self.pattern(text), "unplugged")
+
+    def test_nothing_identifying_in_the_file(self):
+        fx.headset(self.root)
+        text, _ = self.run_report(self.person(plugged={}))
+        host = cw.socket.gethostname()
+        for bad in ("ABC123SERIAL", "203.0.113.20", "aa:bb:cc:dd:ee:ff", os.path.expanduser("~") + "/"):
+            self.assertNotIn(bad, text)
+        if len(host) > 2:
+            self.assertNotIn(host, text)
+        self.assertIn("<host> attached, from <ip> <mac>", text)       # kept, scrubbed
+        kernel = text.split("== Kernel log", 1)[1].split("== charge-watch's own events", 1)[0]
+        self.assertIn("QPH2 entered", kernel); self.assertNotIn("wifi: roamed", kernel)   # charging lines only
+        self.assertIn("BUILD_ID", "".join(open(os.path.join(self.root, "etc/os-release"))))
+        self.assertIn("build 20261106.1", text)
+
+    def test_peripheral_batteries_are_left_out(self):
+        fx.headset(self.root)
+        hid = os.path.join(self.root, "sys/class/power_supply/hid-aa:bb:cc:dd:ee:ff-battery")
+        os.makedirs(hid)
+        for k, v in (("scope", "Device"), ("type", "Battery"), ("model_name", "Sam's Controller"), ("capacity", 80)):
+            with open(os.path.join(hid, k), "w") as f:
+                f.write(f"{v}\n")
+        text, _ = self.run_report(None, guided=False)
+        self.assertNotIn("Sam's Controller", text); self.assertNotIn("aa:bb:cc:dd:ee:ff", text)
+        self.assertEqual(self.pattern(text), "charging")      # the headset's gauge, not the controller's
+
+    def test_no_charger_at_first_asks_to_plug_in(self):
+        fx.headset(self.root, online=0, partner=False, contract_v=None, bat_ua=-400_000)
+        asked = []
+        base = self.person(plugged={}, answers={"Is a charger": "n"})
+        text, _ = self.run_report(lambda p: asked.append(p) or base(p if not p.startswith("Plug the") else
+                                                                     "Plug it back"))
+        self.assertFalse(any(p.startswith("Unplug") for p in asked))
+        self.assertTrue(any(p.startswith("Plug the charger into") for p in asked))
+        self.assertEqual(self.pattern(text), "charging")
+
+    def test_summary_line_reads_back(self):
+        fx.headset(self.root)
+        path = cw.run_report(root=self.root, ask=self.person(plugged={}), say=lambda *_: None, out_dir=self.d,
+                             watch_s=0, poll=0, clock=lambda: 0, slept=lambda: 0)
+        self.assertEqual(cw.summary_line(path)["pattern"], "charging")
+
+
+class SleepNoteTest(unittest.TestCase):
+    def test_notes_a_nap_and_the_battery_across_it(self):
+        t = [0.0]
+        n = cw.SleepNote(slept=lambda: t[0])
+        self.assertIsNone(n.step({"soc": 40, "usb_online": True}))
+        t[0] = 1500
+        ev = n.step({"soc": 47, "usb_online": True})
+        self.assertEqual((ev["event"], ev["minutes"], ev["soc_before"], ev["soc_after"]), ("slept", 25, 40, 47))
+        self.assertIsNone(n.step({"soc": 47}))
+
+
+class ReportsTable(unittest.TestCase):
+    def test_add_renders_a_row_and_check_catches_drift(self):
+        import importlib.util, shutil
+        d = tempfile.mkdtemp(prefix="cw-table-")
+        os.makedirs(os.path.join(d, "data")); os.makedirs(os.path.join(d, "tools"))
+        here = os.path.dirname(HERE)
+        for f in ("charge_watch.py", "tools/reports-table.py"):
+            shutil.copy(os.path.join(here, f), os.path.join(d, f))
+        with open(os.path.join(d, "data/reports.json"), "w") as f:
+            f.write("[]")
+        rep = os.path.join(d, "r.txt")
+        with open(rep, "w") as f:
+            f.write("x\ncharge-watch-summary " + json.dumps({"v": 1, "pattern": "not-detected-but-charges-asleep",
+                    "build": "20261106.1", "charger": "Valve 45 W | own cable", "pdos": [[5, 3], [15, 3]],
+                    "sleep": {"minutes": 30, "soc_delta": 6}}) + "\n")
+        spec = importlib.util.spec_from_file_location("rt", os.path.join(d, "tools/reports-table.py"))
+        rt = importlib.util.module_from_spec(spec)
+        with contextlib.redirect_stdout(io.StringIO()):
+            spec.loader.exec_module(rt)
+            self.assertEqual(rt.main(["add", rep, "--issue", "7"]), 0)
+            self.assertEqual(rt.main(["check"]), 0)
+        with open(os.path.join(d, "REPORTS.md")) as f:
+            md = f.read()
+        self.assertIn("| [#7](https://github.com/frame-commons/charge-watch/issues/7) |", md)
+        self.assertIn("Valve 45 W \\| own cable", md)                 # a | in free text can't break the table
+        self.assertIn("+6 % in 30 min", md)
+        self.assertIn("| **The headset doesn't see the charger while it's on, but it charges while asleep** | 1 |", md)
+        with open(os.path.join(d, "REPORTS.md"), "a") as f:
+            f.write("hand edit\n")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rt.main(["check"]), 1)
 
 
 if __name__ == "__main__":

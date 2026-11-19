@@ -27,6 +27,34 @@ cd charge-watch
 Everything lives in your home directory: no root, nothing changed in SteamOS, and it survives OS updates.
 Remove it with `./install.sh --remove`. To update: `git pull && ./install.sh`.
 
+## Find out what your headset is doing: `charge-watch report`
+
+Not every charging problem is the #2879 bug. Some Frames don't see the charger at all while they're on; some only
+get 5 V; some charge only while asleep. `report` walks you through a short test and writes one plain-text file
+that says which case yours is:
+
+```sh
+./charge_watch.py report                # about 2 minutes: unplug, plug back in, it watches what changes
+./charge_watch.py report --sleep-test   # adds a sleep test (20 minutes or more): does it charge while asleep?
+```
+
+The file has:
+- **A result in plain words**, and what to try next. All the patterns, and how many reports showed each one, are
+  in [REPORTS.md](REPORTS.md).
+- **A paragraph for Valve support**, ready to paste into a ticket.
+- **What it saw** at each step: whether the headset sees a charger, what voltage it agreed with the charger, the
+  battery current, and every charging value the system exposes before and after.
+- **The charge daemon's and the kernel's USB-C/charger log lines** from this boot.
+
+It runs no AI and sends nothing anywhere. Serial numbers, the hostname, your user name, home folder, and MAC and IP
+addresses are removed. **Read the file before you share it.** To share it, open a
+[charging report](https://github.com/frame-commons/charge-watch/issues/new?template=charging-report.yml) and drag
+the file in, or attach it to your Valve ticket. Each shared report adds a row to [REPORTS.md](REPORTS.md):
+its pattern, SteamOS build, charger, and sleep result, nothing else.
+
+While the service runs, it also notes each time the headset was asleep and what the battery did meanwhile (in
+`events.jsonl`, which the report includes).
+
 ## Settings
 
 The installer writes `~/.config/charge-watch/config.json`. Edit it, then `systemctl --user restart charge-watch`.
@@ -121,6 +149,7 @@ charge-watch status [--json]                     one reading, the verdict (exit 
 charge-watch replay FILE [--json] [--shutdown-at PCT]   run the rules over a saved journal
 charge-watch test-alert [--push]                 play the warning once (and send a test push)
 charge-watch test-shutdown                       play the shutdown warning; shows the power-off command, runs nothing
+charge-watch report [--sleep-test] [--quick]     the guided check: one text file with a result and a Valve paragraph
 ```
 
 Command-line options override `config.json`; `charge-watch run --help` lists them all (the rule timings `--hold`,
@@ -149,6 +178,7 @@ happened before a headset died.
 Nothing leaves the headset unless you set up phone push. Then each push carries the message text and battery % (a
 generic webhook also gets the warning's name and the time), and pushes happen only when charge-watch says something. No telemetry. It writes one local log of its warnings,
 `~/.local/state/charge-watch/events.jsonl`.
+`charge-watch report` writes one file in your home folder and sends nothing; you decide whether to share it.
 
 ## Testing it, please
 
@@ -167,6 +197,9 @@ Ours is away for repair, so this needs people with a headset. Any of these help;
    cancel it. Set it back to 5 afterwards.
 5. **If your unit has the bug:** did it warn, and was the warning right? Attach
    `journalctl --user -u charge-watch` and `~/.local/state/charge-watch/events.jsonl`.
+6. **If your unit won't charge, whatever the cause:** run `charge-watch report --sleep-test` and share the file as a
+   [charging report](https://github.com/frame-commons/charge-watch/issues/new?template=charging-report.yml). Each
+   one makes the patterns table better for the next person.
 
 ## Other tools, and how this one differs
 

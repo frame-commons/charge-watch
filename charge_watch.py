@@ -7,6 +7,7 @@
   charge-watch replay FILE [--json]     run the rules over a saved journal (journalctl -o json) and list alerts
   charge-watch test-alert [--push]      play the warning once (and send a test push), to check it reaches you
   charge-watch test-shutdown            play the low-battery shutdown warning; shows the power-off command, runs nothing
+  charge-watch report [--sleep-test]    guided unplug/plug check (and sleep test) -> one text file to read and share
 
 Sources, best first (field names from SteamOS issue #2879):
   1. The charge daemon's status block, logged every ~20 s by deckard_charge_daemon. The lines come in any order;
@@ -42,8 +43,8 @@ watch or warn, and #2879 has units that died in exactly those states.
 Nothing leaves the device unless you set up push; then only the warning text and battery % go to the service you
 name. Events go to ~/.local/state/charge-watch/events.jsonl.
 """
-import argparse, glob, json, math, os, re, select, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, \
-    urllib.parse, urllib.request, wave
+import argparse, getpass, glob, json, math, os, re, select, shlex, shutil, signal, socket, struct, subprocess, sys, tempfile, \
+    textwrap, threading, time, urllib.parse, urllib.request, wave
 
 DAEMON = "deckard_charge_daemon"
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "charge-watch")
@@ -805,6 +806,487 @@ class JournalFollower:
             pass
 
 
+# ---------- report: a file to read, then hand to a helper or to Valve support (charge-watch report) ----------
+# Deterministic: no network, no model. It reads charging-related files and log lines, scrubs anything that
+# could identify the person or their network, asks a few questions, and writes one plain-text file.
+
+REPORT_CLASSES = ("sys/class/power_supply", "sys/class/typec", "sys/class/usb_power_delivery")
+REPORT_RUN = "run/deckardcharger"
+REPORT_IIO = "sys/bus/iio/devices"
+IIO_NAMES = re.compile(r"pm8550|charg|smb|usb|vbus|adc|bat|fg|max1720", re.I)
+SKIP_NAME = re.compile(r"serial|uevent|^modalias$|^(power|subsystem|device|driver|of_node|firmware_node|hwmon\d*|wakeup\d+)$", re.I)
+KERNEL_LINES = re.compile(r"tcpm|typec|ucsi|pdphy|usb.?pd|\bpd\b|vbus|charger|pm8550|pmic|battery|power.?supply|qph", re.I)
+
+
+def _read_capped(path, cap=4096):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read(cap).strip()
+    except OSError:
+        return None
+
+
+def scrubber():
+    """A function that removes what could identify the person or their network from a line of text."""
+    host = socket.gethostname() if hasattr(socket, "gethostname") else ""
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        user = ""
+    home = os.path.expanduser("~")
+    pats = [(re.compile(r"\b[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}\b", re.I), "<mac>"),
+            (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "<uuid>"),
+            (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<ip>"),
+            (re.compile(r"(serial(?:[ _-]?(?:number|no))?\s*[:=]\s*)\S+", re.I), r"\1<serial>")]
+
+    def scrub(s):
+        s = s or ""
+        if home and home != "/":
+            s = s.replace(home, "~")
+        for word, tag in ((host, "<host>"), (user, "<user>")):
+            if word and len(word) > 2:
+                s = re.sub(r"\b%s\b" % re.escape(word), tag, s)
+        for p, r in pats:
+            s = p.sub(r, s)
+        return s
+    return scrub
+
+
+def collect(root="/", scrub=None):
+    """Every readable charging-related value: {relative path: text}. Serial numbers, uevent files and the
+    usual sysfs back-links are skipped; values go through `scrub`."""
+    scrub = scrub or scrubber()
+    out = {}
+
+    def walk(top, label, depth):
+        try:
+            names = sorted(os.listdir(top))
+        except OSError:
+            return
+        for n in names:
+            if SKIP_NAME.search(n):
+                continue
+            p = os.path.join(top, n)
+            if os.path.islink(p) and depth > 0:
+                continue                      # sysfs back-links (device, subsystem …) loop
+            if os.path.isdir(p):
+                if depth == 0 and label.endswith("power_supply") and \
+                        (_read_capped(os.path.join(p, "scope")) or "").lower() == "device":
+                    continue                  # a controller's or a Bluetooth device's battery: not the headset's
+                if depth < 3:
+                    walk(os.path.realpath(p) if depth == 0 else p, f"{label}/{n}", depth + 1)
+            elif os.path.isfile(p) and os.access(p, os.R_OK):
+                v = _read_capped(p)
+                if v is not None:
+                    out[scrub(f"{label}/{n}")] = scrub(v)
+
+    for c in REPORT_CLASSES:
+        walk(os.path.join(root, c), c, 0)
+    walk(os.path.join(root, REPORT_RUN), REPORT_RUN, 1)
+    iio = os.path.join(root, REPORT_IIO)
+    for dev in sorted(os.listdir(iio)) if os.path.isdir(iio) else []:
+        d = os.path.join(iio, dev)
+        name = _read_capped(os.path.join(d, "name")) or ""
+        if not IIO_NAMES.search(name):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.startswith("in_") and f.endswith(("_input", "_raw", "_scale")) or f == "name":
+                v = _read_capped(os.path.join(d, f))
+                if v is not None:
+                    out[scrub(f"{REPORT_IIO}/{dev}/{f}")] = scrub(v)
+    return out
+
+
+def facts(snap):
+    """What a snapshot says, in the few terms the diagnosis needs."""
+    f = {"soc": None, "bat_status": None, "bat_cur": None, "charge_mah": None, "usb_online": False,
+         "partner": False, "contract_v": None, "pdos": [], "detail": {}, "vbus_v": None}
+    gauges = sorted(k.rsplit("/", 1)[0] for k in snap if k.startswith("sys/class/power_supply/") and
+                    k.endswith("/type") and snap[k] == "Battery" and "charger" not in k)
+    gauges.sort(key=lambda g: ("max1720x" not in g, g))
+    if gauges:
+        g = gauges[0]
+        f["soc"] = _num(snap.get(g + "/capacity"))
+        f["soc"] = int(f["soc"]) if f["soc"] is not None else None
+        f["bat_status"] = snap.get(g + "/status")
+        f["bat_cur"] = _num(snap.get(g + "/current_now"), 1e6)
+        f["charge_mah"] = _num(snap.get(g + "/charge_now"), 1e3)
+    for k, v in snap.items():
+        if not k.startswith("sys/class/power_supply/"):
+            continue
+        sup = k.rsplit("/", 1)[0]
+        typ = snap.get(sup + "/type")
+        if k.endswith("/online") and v == "1" and (typ in ("USB", "USB_C", "USB_PD", "Mains") or "tcpm-source" in sup):
+            f["usb_online"] = True
+        if k.endswith("/status_detailed"):
+            f["detail"] = parse_detail(v)
+    f["partner"] = any(re.match(r"sys/class/typec/port\d+-partner/", k) for k in snap) or \
+        any(re.match(r"sys/class/typec/port\d+/port\d+-partner/", k) for k in snap)
+    m = re.search(r"Voltage=(\d+)mV", snap.get(REPORT_RUN + "/typec_contract", ""))
+    if m:
+        f["contract_v"] = int(m.group(1)) / 1000
+    if snap.get(REPORT_RUN + "/ac_status") == "Connected":
+        f["usb_online"] = True
+    caps = {}
+    for k, v in snap.items():
+        m = re.match(r"sys/class/usb_power_delivery/(pd\d+)/source-capabilities/([^/]+)/(voltage|maximum_voltage|"
+                     r"maximum_current)$", k)
+        if m:
+            caps.setdefault((m.group(1), m.group(2)), {})[m.group(3)] = _num(re.sub(r"[^\d]", "", v))
+    for (_, pdo), c in sorted(caps.items(), key=lambda x: x[0][1]):
+        volt = c.get("voltage") or c.get("maximum_voltage")
+        if volt:
+            f["pdos"].append((round(volt / 1000, 1), round((c.get("maximum_current") or 0) / 1000, 2)))
+    f["pdos"] = sorted(set(f["pdos"]))
+    for k, v in snap.items():
+        if k.startswith(REPORT_IIO) and re.search(r"(usb.?in|vbus).*(volt|_v)|in_voltage.*(usb|vbus)", k, re.I) \
+                and k.endswith("_input"):
+            n = _num(v)
+            if n is not None:
+                f["vbus_v"] = round(n / 1e6 if n > 1e5 else n / 1e3 if n > 100 else n, 2)
+    return f
+
+
+def seen(f):
+    """Does the headset see a power source at all?"""
+    return bool(f["usb_online"] or f["partner"] or f["contract_v"] or (f["vbus_v"] or 0) > 4.0)
+
+
+def short(f):
+    pd = (f"{f['contract_v']:.0f} V agreed" if f["contract_v"] else "no PD contract")
+    cur = f"{f['bat_cur']:+.2f} A" if f["bat_cur"] is not None else "? A"
+    return (f"{'sees power' if seen(f) else 'sees NO power'} (USB online {'yes' if f['usb_online'] else 'no'}, "
+            f"USB-C partner {'yes' if f['partner'] else 'no'}, {pd}"
+            + (f", VBUS {f['vbus_v']} V" if f["vbus_v"] is not None else "") + f"), battery {cur}"
+            + (f", {f['soc']} %" if f["soc"] is not None else ""))
+
+
+def boot_sleep_total():
+    """Seconds this boot has spent suspended (CLOCK_BOOTTIME keeps counting in suspend, MONOTONIC stops)."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    except (AttributeError, OSError):
+        return 0.0
+
+
+FINDINGS = {
+    "not-detected-but-charges-asleep": (
+        "The headset doesn't see the charger while it's on, but it charges while asleep",
+        "While the headset is awake, nothing on its USB-C side reacts to the charger: no USB power, no USB-C "
+        "partner, no power agreement. Asleep, the battery went up. So the charger and cable work, and the "
+        "headset's USB-C power detection fails only while the system runs. Charge it asleep or off for now. "
+        "charge-watch's auto-shutdown (\"shutdown_at\" in its settings) turns it off before it runs flat, "
+        "and then it charges."),
+    "not-detected": (
+        "The headset doesn't see the charger at all",
+        "With the charger plugged in, nothing on the headset's USB-C side reacts: no USB power, no USB-C "
+        "partner, no power agreement. Try another cable and another charger. If none is ever seen, "
+        "it's the headset, not the charger. Run the sleep test too: some units charge only while asleep."),
+    "qph2-stuck": (
+        "The charger chip is stuck (the QPH2 bug, SteamOS issue #2879)",
+        "The headset agreed power with the charger, but its charger chip went into its QPH2 mode and stopped "
+        "taking input. Reseat the cable or switch chargers. #2879 has a workaround (a root change: read the "
+        "thread first)."),
+    "input-refused": (
+        "The headset sees the charger but refuses its power",
+        "The charger chip reports no usable input, without the QPH2 state. #2879 reports this with some power "
+        "banks. Try a wall charger and another cable."),
+    "pd-not-negotiated": (
+        "The charger offers more than 5 V, but the headset stays at 5 V",
+        "The charger advertises higher voltages, but the headset never agreed to one. It charges slowly at "
+        "best, and drains while in use. Try another cable: a cable without USB-C PD support causes exactly "
+        "this."),
+    "5v-only": (
+        "Only 5 V: a slow charger or cable",
+        "The headset gets 5 V and no USB-C power agreement. That charges slowly when idle and can't keep up in "
+        "use. Use a USB-C PD charger (9 V or more) and a PD cable."),
+    "cant-keep-up": (
+        "Power comes in, but the battery still drains",
+        "Current is flowing in, but the battery gauge shows the battery losing charge. The charger is too weak "
+        "for the load. Use a stronger PD charger."),
+    "charging": (
+        "Charging normally",
+        "With this charger and cable, the battery is charging. If it fails at other times, run the report again "
+        "then, while it's happening."),
+    "unplugged": (
+        "No charger plugged in",
+        "Run `charge-watch report` with the charger you want to test plugged in, and follow the steps."),
+    "unclear": (
+        "No known pattern matched",
+        "Nothing here matches a pattern charge-watch knows. Please share the report: it's exactly what's "
+        "needed to learn a new one."),
+}
+
+
+def diagnose(steps, user_plugged=None, sleep=None):
+    """steps: [(label, facts)], the last one being 'now, plugged in' for a guided run. Returns a pattern id."""
+    allf = [f for _, f in steps]
+    last = allf[-1]
+    plugged_now = user_plugged if user_plugged is not None else seen(last)
+    if not plugged_now:
+        return "unplugged"
+    if any(f["detail"].get("Input OK") == 0 and f["detail"].get("QPH2") == 1 for f in allf):
+        return "qph2-stuck"
+    replug = [f for label, f in steps if label.startswith("plugged")] or [last]
+    if user_plugged and not any(seen(f) for f in replug):
+        if sleep and sleep.get("charged"):
+            return "not-detected-but-charges-asleep"
+        return "not-detected"
+    if any(f["detail"].get("Input OK") == 0 for f in replug):
+        return "input-refused"
+    full = last["bat_status"] == "Full" or (last["soc"] or 0) >= 95 and last["bat_status"] == "Not charging"
+    if (last["bat_cur"] or 0) > 0.05 or last["bat_status"] == "Charging" or full:
+        if (last["contract_v"] or 0) <= 5.5 and any(v > 5.5 for v, _ in last["pdos"]):
+            return "pd-not-negotiated"
+        return "charging"
+    if last["contract_v"] is not None and last["contract_v"] <= 5.5:
+        return "pd-not-negotiated" if any(v > 5.5 for v, _ in last["pdos"]) else "5v-only"
+    if (last["bat_cur"] or 0) < -0.1 and seen(last):
+        return "cant-keep-up"
+    return "unclear"
+
+
+def os_info(root="/"):
+    rel = {}
+    for line in (_read_capped(os.path.join(root, "etc/os-release"), 8192) or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            rel[k] = v.strip().strip('"')
+    return {"name": rel.get("PRETTY_NAME") or rel.get("NAME"), "version": rel.get("VERSION_ID"),
+            "build": rel.get("BUILD_ID"), "kernel": os.uname().release if hasattr(os, "uname") else None}
+
+
+def journal_lines(args, pattern=None, n=150, scrub=None):
+    """`journalctl -o json` lines as 'HH:MM:SS message' (no hostname field), filtered, scrubbed, last n."""
+    scrub = scrub or scrubber()
+    try:
+        r = subprocess.run(["journalctl", "--no-pager", "-q", "-o", "json"] + args, capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ["(journal not readable)"]
+    out = []
+    for raw in r.stdout.splitlines():
+        e = _journal_entry(raw)
+        if not e:
+            continue
+        t, msg = e
+        if pattern and not pattern.search(msg):
+            continue
+        out.append(time.strftime("%m-%d %H:%M:%S", time.gmtime(t)) + "Z " + scrub(msg))
+    return out[-n:] or ["(nothing)"]
+
+
+def valve_text(pattern, info, f0, steps, sleep, charger):
+    pd = ", ".join(f"{v:g} V {a:g} A" for v, a in f0["pdos"]) if f0["pdos"] else None
+    lines = [f"Steam Frame, {info.get('name') or 'SteamOS'} build {info.get('build') or '?'}."]
+    lines.append(f"Charger and cable: {charger or '<fill in: charger model and wattage, cable>'}"
+                 + (f" (the charger advertises {pd})." if pd else "."))
+    obs = {
+        "not-detected-but-charges-asleep": "While the headset is on, it does not detect the charger at all: no "
+                                           "USB power, no USB-C partner, no PD contract. It does charge while "
+                                           "asleep or off.",
+        "not-detected": "With the charger plugged in, the headset does not detect it at all: no USB power, no "
+                        "USB-C partner, no PD contract.",
+        "qph2-stuck": "The charger chip enters QPH2 and stops taking input (status_detailed: Input OK 0, QPH2 1), "
+                      "so the battery drains while plugged in. This matches SteamOS issue #2879.",
+        "input-refused": "The headset sees the charger, but the charger chip reports no usable input "
+                         "(status_detailed: Input OK 0).",
+        "pd-not-negotiated": "The charger offers more than 5 V, but the headset never negotiates above 5 V.",
+        "5v-only": "The headset only ever gets 5 V and no PD contract.",
+        "cant-keep-up": "Current flows in, but the battery still discharges while plugged in.",
+    }.get(pattern)
+    if obs:
+        lines.append(obs)
+    if sleep and sleep.get("minutes"):
+        lines.append(f"Sleep test: {sleep['summary']}.")
+    lines.append("Recorded with charge-watch's guided test (github.com/frame-commons/charge-watch); the full report "
+                 "is attached.")
+    return " ".join(lines)
+
+
+def _wait_enter(ask, prompt):
+    try:
+        ask(prompt)
+        return True
+    except EOFError:
+        return False
+
+
+def run_report(root="/", ask=input, say=print, guided=True, sleep_test=None, charger=None, out_dir=None,
+               watch_s=30, sleep_wait_s=3600, awake_s=300, poll=2.0, clock=time.monotonic, slept=boot_sleep_total):
+    """The guided report. `ask`/`say` are the console (tests pass their own). Returns the report's path."""
+    scrub = scrubber()
+    say("charge-watch report: " + ("a few questions, then " if guided else "") +
+        "one text file you can read before you share it.")
+    say("It reads charging-related files and log lines on this headset. It sends nothing anywhere.\n")
+    t_start = time.time()
+    steps, timeline, user_plugged, sleep = [], [], None, None
+    snap0 = collect(root, scrub)
+    steps.append(("as found", facts(snap0)))
+    snaps = {"as found": snap0}
+    if guided:
+        a = ""
+        try:
+            a = ask("Is a charger plugged into the headset right now? [y/n] ").strip().lower()
+        except EOFError:
+            guided = False
+        if guided:
+            if not charger:
+                try:
+                    charger = ask("Which charger and cable? (e.g. 'Valve 45 W, its own cable'; Enter to skip) ").strip() or None
+                except EOFError:
+                    pass
+            had = not a.startswith("n")
+            if had:
+                ok = _wait_enter(ask, "Unplug the charger from the headset now, then press Enter. ")
+                if ok:
+                    time.sleep(min(5, poll * 2))
+                    s = collect(root, scrub); snaps["unplugged"] = s; steps.append(("unplugged", facts(s)))
+                    say("  unplugged: " + short(steps[-1][1]))
+            else:
+                ok = True
+            if ok:
+                if _wait_enter(ask, ("Plug it back in now" if had else "Plug the charger into the headset now") +
+                               ", then press Enter. "):
+                    user_plugged = True
+                    say(f"  watching for {watch_s} s …")
+                    t0 = clock()
+                    while True:
+                        s = collect(root, scrub); f = facts(s)
+                        timeline.append((round(clock() - t0), f))
+                        if clock() - t0 >= watch_s:
+                            break
+                        time.sleep(poll)
+                    snaps["plugged in"] = s; steps.append(("plugged in", f))
+                    say("  plugged in: " + short(f))
+            elif a.startswith("y"):
+                user_plugged = True
+            if sleep_test is None:
+                try:
+                    sleep_test = ask("Optional sleep test, 20 minutes or more: does it charge while asleep? "
+                                     "[y/N] ").strip().lower().startswith("y")
+                except EOFError:
+                    sleep_test = False
+            if sleep_test:
+                sleep = run_sleep_test(root, ask, say, scrub, sleep_wait_s, awake_s, poll, slept)
+    pattern = diagnose(steps, user_plugged, sleep)
+    title, explain = FINDINGS[pattern]
+    info = os_info(root)
+    f0 = steps[-1][1]
+    text = [f"charge-watch report, {time.strftime('%Y-%m-%d %H:%M', time.gmtime(t_start))} UTC",
+            "",
+            "READ THIS BEFORE YOU SHARE IT. It holds charging values from this headset's system files, the charge",
+            "daemon's and the kernel's USB-C/charger log lines from this boot, and your answers. Serial numbers,",
+            "the hostname, user name, home folder, MAC and IP addresses are removed. Nothing was sent anywhere.",
+            "", "== Result ==", title, "", textwrap.fill(explain, 110), "",
+            "== For Valve support (copy and paste; one line on purpose) ==",
+            valve_text(pattern, info, f0, steps, sleep, charger), "",
+            "== What it saw =="]
+    text += [f"{label}: {short(f)}" for label, f in steps]
+    if timeline:
+        text += ["", "After plugging back in (seconds: what it saw):"]
+        text += [f"  +{t:>3} s  {short(f)}" for t, f in timeline]
+    if sleep:
+        text += ["", "== Sleep test ==", sleep["summary"]]
+    text += ["", "== System ==", f"{info.get('name')}, version {info.get('version')}, build {info.get('build')}, "
+                                  f"kernel {info.get('kernel')}", f"user answer, charger plugged in: "
+                                                                 f"{'yes' if user_plugged else 'no/unknown'}",
+             f"charger and cable (user): {charger or '-'}", ""]
+    text += ["== Charge daemon log, this boot (last 150 lines) =="]
+    text += journal_lines(["-b", "-t", DAEMON], n=150, scrub=scrub)
+    text += ["", "== Kernel log, USB-C and charger lines, this boot (last 150) =="]
+    text += journal_lines(["-k", "-b"], KERNEL_LINES, n=150, scrub=scrub)
+    ev = []
+    try:
+        with open(os.path.join(STATE_DIR, "events.jsonl")) as fh:
+            ev = fh.read().splitlines()[-50:]
+    except OSError:
+        pass
+    text += ["", "== charge-watch's own events (last 50) =="] + ([scrub(e) for e in ev] or ["(none)"])
+    text += ["", "== Values: as found =="] + [f"{k} = {v}" for k, v in sorted(snap0.items())]
+    prev = snap0
+    for label in ("unplugged", "plugged in"):
+        if label in snaps:
+            diff = {k: v for k, v in snaps[label].items() if prev.get(k) != v}
+            gone = [k for k in prev if k not in snaps[label]]
+            text += ["", f"== Values: changed when {label} =="] + [f"{k} = {v}" for k, v in sorted(diff.items())] \
+                + [f"{k} (gone)" for k in sorted(gone)] + ([] if diff or gone else ["(nothing changed)"])
+            prev = snaps[label]
+    summary = {"v": 1, "pattern": pattern, "build": info.get("build"), "version": info.get("version"),
+               "charger": charger, "pdos": f0["pdos"], "guided": bool(guided and user_plugged is not None),
+               "sleep": {k: sleep[k] for k in ("minutes", "soc_delta", "mah_delta", "charged") if k in sleep}
+               if sleep else None}
+    text += ["", "== Summary (one line, for the reports table) ==", "charge-watch-summary " + json.dumps(summary)]
+    out_dir = out_dir or os.path.expanduser("~")
+    path = os.path.join(out_dir, time.strftime("charge-watch-report-%Y%m%dT%H%MZ.txt", time.gmtime(t_start)))
+    with open(path, "w") as fh:
+        fh.write("\n".join(text) + "\n")
+    say(f"\nResult: {title}")
+    say(f"\nWrote {path}")
+    say("Read it first. To share it: open https://github.com/frame-commons/charge-watch/issues/new?template="
+        "charging-report.yml and drag the file in, or attach it to your Valve support ticket.")
+    return path
+
+
+def run_sleep_test(root, ask, say, scrub, wait_s, awake_s, poll, slept):
+    """Charge gained across one suspend, then over `awake_s` awake, both on the charger."""
+    a = facts(collect(root, scrub)); s0 = slept()
+    if not _wait_enter(ask, "Keep the charger plugged in. Press Enter, then put the headset to sleep (power button). "
+                            "Wake it after 20 minutes or more; the test carries on by itself. "):
+        return None
+    t0 = time.monotonic()
+    while slept() - s0 < 60 and time.monotonic() - t0 < wait_s:
+        time.sleep(poll)
+    asleep = slept() - s0
+    if asleep < 60:
+        return {"summary": "No sleep was detected, so there is no sleep result."}
+    time.sleep(min(10, poll * 5))
+    b = facts(collect(root, scrub))
+    say(f"  awake again after {asleep / 60:.0f} min asleep; now {awake_s // 60} min awake on the charger …")
+    time.sleep(awake_s)
+    c = facts(collect(root, scrub))
+    res = {"minutes": round(asleep / 60), "soc_delta": None, "mah_delta": None}
+    if a["soc"] is not None and b["soc"] is not None:
+        res["soc_delta"] = b["soc"] - a["soc"]
+    if a["charge_mah"] is not None and b["charge_mah"] is not None:
+        res["mah_delta"] = round(b["charge_mah"] - a["charge_mah"])
+    res["charged"] = (res["mah_delta"] or 0) > 20 or (res["soc_delta"] or 0) >= 1
+    awake = ""
+    if b["soc"] is not None and c["soc"] is not None:
+        awake = f"; then {c['soc'] - b['soc']:+d} % in {awake_s // 60} min awake"
+    if b["charge_mah"] is not None and c["charge_mah"] is not None:
+        awake += f" ({c['charge_mah'] - b['charge_mah']:+.0f} mAh)"
+    gain = f"{res['soc_delta']:+d} %" if res["soc_delta"] is not None else "?"
+    if res["mah_delta"] is not None:
+        gain += f" ({res['mah_delta']:+d} mAh)"
+    res["summary"] = f"{gain} in {res['minutes']} min asleep on the charger{awake}"
+    return res
+
+
+def summary_line(path):
+    """The reports-table entry for a report file (for maintainers: data/reports.json)."""
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("charge-watch-summary "):
+                return json.loads(line.split(" ", 1)[1])
+    raise ValueError("no charge-watch-summary line in " + path)
+
+
+class SleepNote:
+    """While `run` watches: notices that the headset was asleep, and what the battery did meanwhile."""
+    def __init__(self, slept=boot_sleep_total):
+        self.slept, self.last, self.prev = slept, slept(), None
+
+    def step(self, s):
+        now, ev = self.slept(), None
+        if now - self.last >= 60 and self.prev is not None:
+            ev = {"t": time.time(), "event": "slept", "minutes": round((now - self.last) / 60),
+                  "soc_before": self.prev.get("soc"), "soc_after": s.get("soc"),
+                  "plugged_before": bool(plugged(self.prev)), "plugged_after": bool(plugged(s))}
+        self.last, self.prev = now, s
+        return ev
+
+
 # ---------- commands ----------
 
 SETTINGS = {"repeat": int, "repeat_low": int, "volume_floor": float, "beeps": int, "push_repeat": int,
@@ -1007,7 +1489,14 @@ def cmd_run(a):
         alert(k, o["alert"], _say(o), o["volume_floor"], 1 if k == "poweroff" else o["beeps"], text=text, voice=o["voice"])
         return th
 
+    naps = SleepNote()
+
     def handle(s):
+        nap = naps.step(s)
+        if nap:
+            log_event(nap)
+            print(f"charge-watch: was asleep {nap['minutes']} min; battery {nap['soc_before']} -> {nap['soc_after']} %"
+                  f"{' (on the charger)' if nap['plugged_before'] else ''}", flush=True)
         act = rules.step(s)
         for k in ann.step(s["t"], act, plugged(s), charging_now(s), s.get("soc")) + guard.step(s, time.monotonic()):
             th = fire(k, s)
@@ -1052,6 +1541,12 @@ def cmd_run(a):
         jf.close()
 
 
+def cmd_report(a):
+    run_report(root=a.root, guided=not a.quick, sleep_test=True if a.sleep_test else (False if a.quick else None),
+               charger=a.charger, out_dir=a.out)
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="charge-watch", description=__doc__.split("\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n", 2)[2])
@@ -1092,8 +1587,17 @@ def main(argv=None):
     ta.add_argument("--push", action="store_true", help="also send a test push to the services in the config")
     ts = sub.add_parser("test-shutdown"); alert_args(ts)
     ts.add_argument("--shutdown-at", type=int, help=argparse.SUPPRESS); ts.add_argument("--countdown", type=int, help=argparse.SUPPRESS)
+    rep = sub.add_parser("report", help="a guided check that writes one text file to read, then share if you want",
+                         description="Writes a plain-text charging report: what the headset sees as you unplug and plug "
+                                     "the charger, optionally whether it charges while asleep, a result in plain "
+                                     "words, and a paragraph for Valve support. Nothing is sent anywhere.")
+    rep.add_argument("--quick", action="store_true", help="no questions: just record what it sees now")
+    rep.add_argument("--sleep-test", action="store_true", help="include the sleep test without asking")
+    rep.add_argument("--charger", help="the charger and cable, e.g. 'Anker 65 W, Valve cable'")
+    rep.add_argument("--out", help="folder for the report (default: your home folder)")
+    rep.add_argument("--root", default="/", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
-    return {"run": cmd_run, "status": cmd_status, "replay": cmd_replay, "test-alert": cmd_test_alert,
+    return {"run": cmd_run, "report": cmd_report, "status": cmd_status, "replay": cmd_replay, "test-alert": cmd_test_alert,
             "test-shutdown": cmd_test_shutdown}[a.cmd](a)
 
 

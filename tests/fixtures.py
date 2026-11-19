@@ -51,3 +51,35 @@ def sysfs(root, soc=50, status="Charging", online=1, volts=15_000_000, bat_ua=50
     w("pm0000-charger/status_detailed", "\n".join(f"{k}: {v}" for k, v in det.items()))
     w("tcpm-source-psy-0/type", "USB"); w("tcpm-source-psy-0/online", online); w("tcpm-source-psy-0/voltage_now", volts)
     return root
+
+
+def headset(root, soc=50, online=1, partner=True, contract_v=15.0, pdos=((5, 3), (9, 3), (15, 3)), bat_ua=500_000,
+            charge_uah=2_000_000, detail=None, serial="ABC123SERIAL", build="20261106.1"):
+    """A fake root: power_supply (via sysfs()), typec, usb_power_delivery, /run/deckardcharger, /etc/os-release.
+    Call again on the same root to change it (unplug, plug in, sleep)."""
+    import shutil
+    for d in ("sys/class/typec/port0-partner", "sys/class/usb_power_delivery", "run/deckardcharger"):
+        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    ps = os.path.join(root, "sys/class/power_supply")
+    sysfs(ps, soc=soc, online=online, volts=int((contract_v or 5) * 1e6) if online else 0, bat_ua=bat_ua,
+          detail=detail)
+
+    def w(p, v):
+        p = os.path.join(root, p)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(f"{v}\n")
+    w("sys/class/power_supply/max1720x_bat_0-00/charge_now", charge_uah)
+    w("sys/class/power_supply/max1720x_bat_0-00/serial_number", serial)
+    w("sys/class/typec/port0/data_role", "[host] device")
+    if partner:
+        w("sys/class/typec/port0-partner/usb_power_delivery_revision", "3.0")
+        for i, (v, a) in enumerate(pdos or (), 1):
+            w(f"sys/class/usb_power_delivery/pd0/source-capabilities/{i}:fixed_supply/voltage", f"{int(v * 1000)}mV")
+            w(f"sys/class/usb_power_delivery/pd0/source-capabilities/{i}:fixed_supply/maximum_current",
+              f"{int(a * 1000)}mA")
+    if online and contract_v:
+        w("run/deckardcharger/typec_contract", f"Voltage={int(contract_v * 1000)}mV Current=3000mA")
+        w("run/deckardcharger/ac_status", "Connected")
+    w("etc/os-release", f'NAME="SteamOS"\nPRETTY_NAME="SteamOS"\nVERSION_ID=3.8\nBUILD_ID={build}\n')
+    return root
