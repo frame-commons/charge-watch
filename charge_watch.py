@@ -164,9 +164,11 @@ def parse_detail(text):
     return {k.strip(): int(v) for k, v in DETAIL.findall(text or "")}
 
 
-def read_sysfs(root="/sys/class/power_supply", run_dir="/run/deckardcharger"):
+def read_sysfs(root="/sys/class/power_supply", run_dir="/run/deckardcharger", typec=None):
     """The battery's fuel gauge (preferred over the charger chip), whether a USB supply is online, the offered
-    voltage, and the charger chip's status_detailed if present."""
+    voltage, and the charger chip's status_detailed if present.
+    Plugged in also counts when a USB-C partner is attached and a power contract of 4.5 V or more stands, even with
+    every supply offline: the power-bank case in #2879 (15 V agreed, Input OK 0, the charger chip offline)."""
     s = {"t": time.time(), "src": "sysfs"}
     online, bats = False, []
     for d in sorted(glob.glob(os.path.join(root, "*"))):
@@ -194,6 +196,9 @@ def read_sysfs(root="/sys/class/power_supply", run_dir="/run/deckardcharger"):
     m = re.search(r"Voltage=(\d+)mV", _read(os.path.join(run_dir, "typec_contract")) or "")
     if m:
         s["usb_neg_v"] = int(m.group(1)) / 1000
+        typec = typec or os.path.join(os.path.dirname(os.path.abspath(root)), "typec")
+        if s["usb_neg_v"] >= 4.5 and glob.glob(os.path.join(typec, "port*-partner")):
+            online = True     # the partner exists only while something is attached, so a stale contract can't count
     s["usb_online"] = 1 if online else 0
     return s
 

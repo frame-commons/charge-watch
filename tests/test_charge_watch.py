@@ -156,6 +156,24 @@ class Rules(unittest.TestCase):
         act = self._sys(4, detail={"Input OK": 0, "IMP Trigger": 0, "QPH2": 0}, bat_cur=-0.9)
         self.assertIn("no-input", act); self.assertNotIn("stuck", act)
 
+    def test_power_bank_with_every_supply_offline(self):
+        """#2879 (eikaramba, INIU 100 W bank): 15 V/3 A agreed, VBUS 15.3 V, but Input OK 0, the charger chip
+        online=0 and Discharging, the tcpm supply offline too. The sysfs path must still warn."""
+        root = tempfile.mkdtemp()
+        fx.headset(root, online=0, partner=True, contract_v=None, bat_ua=-1_200_000,
+                   detail={"Input OK": 0, "IMP Trigger": 0, "QPH2": 0})
+        run = os.path.join(root, "run/deckardcharger"); os.makedirs(run, exist_ok=True)
+        with open(os.path.join(run, "typec_contract"), "w") as f:
+            f.write("Voltage=15000mV Current=3000mA\n")
+        s = cw.read_sysfs(os.path.join(root, "sys/class/power_supply"), run_dir=run)
+        self.assertTrue(cw.plugged(s))
+        rules, act = cw.Rules(), []
+        for i in range(8):
+            act = rules.step({**s, "t": 1000 + 20 * i})
+        self.assertIn("no-input", act)
+        os.rename(os.path.join(root, "sys/class/typec/port0-partner"), os.path.join(root, "gone"))   # unplugged:
+        self.assertFalse(cw.plugged(cw.read_sysfs(os.path.join(root, "sys/class/power_supply"), run_dir=run)))
+
     def test_hot_battery_is_not_a_fault(self):
         self.assertEqual(self._sys(10, bat_status="Discharging", bat_cur=-0.4, bat_temp=44.0), [])
 
