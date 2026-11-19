@@ -620,14 +620,27 @@ class Speech(unittest.TestCase):
 
     def test_every_spoken_line_has_a_clip(self):
         repo_voice = os.path.join(os.path.dirname(HERE), "voice")
-        if not os.path.isdir(repo_voice):
-            self.skipTest("no voice/ in this checkout (made by tools/make-voice.py)")
+        import hashlib, re
+        listed = {}
+        with open(os.path.join(repo_voice, "SOURCES")) as f:
+            for line in f:
+                m = re.match(r"^([0-9a-f]{64})  (\S+)\.wav  synthetic: .*, text ([0-9a-f]{12})$", line.strip())
+                if m:
+                    listed[m.group(2)] = (m.group(1), m.group(3))
+        self.assertEqual(sorted(listed), sorted(cw.SPOKEN))
+        self.assertEqual(sorted(n[:-4] for n in os.listdir(repo_voice) if n.endswith(".wav")), sorted(cw.SPOKEN))
+        for kind, (audio, text) in listed.items():
+            with open(os.path.join(repo_voice, kind + ".wav"), "rb") as f:
+                self.assertEqual(hashlib.sha256(f.read()).hexdigest(), audio, f"{kind}.wav changed: run tools/make-voice.py")
+            self.assertEqual(hashlib.sha256(cw.SPOKEN[kind].encode()).hexdigest()[:12], text,
+                             f"the {kind} line changed but its clip was not remade: run tools/make-voice.py")
         for kind in cw.SPOKEN:
             p = os.path.join(repo_voice, kind + ".wav")
             self.assertTrue(os.path.isfile(p), kind)
             with wave.open(p) as w:
                 self.assertEqual((w.getframerate(), w.getnchannels()), (16000, 1), kind)
                 self.assertGreater(w.getnframes(), 8000, kind)
+                self.assertLessEqual(w.getnframes() / 16000, 15.0, kind)     # the publishing check's bound
         for kind in cw.MESSAGES:
             self.assertIn(kind, cw.SPOKEN)
 

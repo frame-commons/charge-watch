@@ -7,10 +7,17 @@ here=$(cd "$(dirname "$0")" && pwd)
 bin="$HOME/.local/bin/charge-watch"
 unit="$HOME/.config/systemd/user/charge-watch.service"
 voice="${XDG_DATA_HOME:-$HOME/.local/share}/charge-watch/voice"
+case "${1:-}" in
+    ""|--remove) ;;
+    -h|--help) echo "usage: ./install.sh            install (or update) charge-watch for this user and start it"
+               echo "       ./install.sh --remove   stop and remove it (settings and log stay)"; exit 0 ;;
+    *) echo "install.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
+esac
 if [ "${1:-}" = "--remove" ]; then
     systemctl --user disable --now charge-watch.service 2>/dev/null || true
     rm -f "$bin" "$unit"
     rm -rf "$voice"
+    rmdir "$(dirname "$voice")" 2>/dev/null || true
     systemctl --user daemon-reload
     echo "charge-watch removed (its settings stay in ~/.config/charge-watch/, its log in ~/.local/state/charge-watch/)"
     exit 0
