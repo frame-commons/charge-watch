@@ -5,10 +5,10 @@ d3ec60ea70e06c71081035b22dca0109fb3d7a5a81a7ee4b8312bc8845685f96  discharge.wav 
 d573b68e322cdd81255df8dab976475ab30c6bd0e109b43040f277e4f68b7727  draining.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text ad3617ac34e3
 e3822d29099e1c3b6cf9f64862005317f89219008889d12708fba7b4afe6d1dd  no-input.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 7bb9098bd10c
 d7b3fd2fc7a62f828e15652ffbadd15f5f226858bd8d4fd6d7e5df02bd2a9e54  ok.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 60699ae5ec77
-3244d3afd7dc28bb5b0b6f835fb3ec910f2a41cb525771a5f7afdbf11e4ac280  poweroff.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text f9bb53684f8f
+799bd6fcf9510f52e35449a7c9556776a27168529c07fb6c312c48d11e501450  poweroff.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text c96a397551bd
 a6b357a435a870d24258dd262751e4b230fec970c2ec6a74acf9be7e3fc0220b  poweroff-failed.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 7b6b4b5d058d
 11773fb35e4a024f89286c229086fc62dba9e593422e5eaf9add33decc68c293  shutdown-cancel.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 944d76ff66f2
-30943d32113c4f63a56a7c50131f24c3e4ad5ed838747c0ac65196d376054b44  shutdown-warn.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 59880c4a3946
+ca666a9efc5e275c81baa50a39353d26c9965546246f337e56893db60c789bee  shutdown-warn.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 5b05c517ce7c
 66158f8786adefd99c95a3f38aeaf36ebad203ad6922e13fbeab2cb12d02e988  slow.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 5615c7620149
 033ab596dbcab20fbeb7cf0d5f1620f52974eb32361701ac2bd06636cad32fbf  stuck.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 9b0a88645f49
 6ad75548a0874e7984fac659e54a648d5777c79353c7aa283dd333508393e063  test.wav  synthetic: Kokoro-82M (Apache-2.0), voice am_puck, speed 1, text 1b313df3108c

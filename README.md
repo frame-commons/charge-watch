@@ -7,8 +7,9 @@ Some Frames get stuck in a charger state where they take little or no power from
 ([SteamOS #2879](https://github.com/ValveSoftware/SteamOS/issues/2879), "QPH2"). The headset then drains while
 plugged in, and several have died on their chargers. Steam shows a small yellow "!" on the battery icon, which is
 easy to miss inside a game. charge-watch sounds an alarm instead, says what's wrong, and keeps at it until it's fixed.
-It can also push the warning to your phone, and power the headset off at a low battery level you choose, because a
-Frame that runs completely flat may never charge again (#2879).
+It can also push the warning to your phone, and, as a last resort, power the headset off at a low battery level you
+choose. That alone is not safe: a Frame that runs completely flat may never charge again, and units left powered off
+on a stuck charger have drained too (#2879). Unplug it and use a charger that works.
 
 > **Status: early, and looking for testers.** Tested on synthetic logs in the formats and line order quoted in #2879.
 > It has **not yet run on a headset**: ours died of this bug and is away for repair. Whether the notification shows
@@ -77,9 +78,13 @@ in between, it starts over when it wakes, and never powers off straight from wak
 so out loud and tries again. It uses SteamOS's own power-off helper
 (`steamos-poweroff-now`, then `systemctl poweroff`), so it needs no root. Both work as the normal user on a Frame
 from a terminal; that they also work from the background service is what tester step 4 checks. **Why:** #2879 has several units that ran to 0 % and never charged
-again, even on a good charger. 5 % is a guess at a safe margin, not a measured one. **What it can't do:** after it
-shuts down, the battery is still low. Charge it on a *different* charger or cable, and check the % goes up. #2879
-also has units that drained while powered off on a charger that was stuck.
+again, even on a good charger. 5 % is a guess, not a measured margin.
+
+**Shutting down does not make it safe.** It is a last resort for when nobody hears the warnings. #2879 has units
+that were left **powered off on a charger** at 10-15 % in the stuck state and drained overnight to a unit that never
+came back. Powered off, the battery keeps draining and nothing can warn you. So when it has shut down (or when you
+hear any not-charging warning): **unplug it**, then charge it on a *different*, known-good charger or cable and check
+the % goes up, or apply the #2879 workaround. Never let it reach 0 %.
 
 **Loudness.** For each alarm it unmutes and raises the volume to at least `volume_floor` (0-1; `0` = leave the volume
 alone), plays a high-low alarm `beeps` times, then puts your volume back. Severe warnings repeat every `repeat`
@@ -101,7 +106,7 @@ A warning is pushed when it starts, then at most every 10 minutes while it lasts
 
 | Warning | What it means | What to do |
 |---|---|---|
-| **stuck** | The charger chip is in QPH2 with no input: `Input OK: 0` + `QPH2: 1` in `status_detailed`, or `QPH(2)` with under 0.10 A in the daemon log. This is the #2879 bug. | Reseat the cable or switch chargers. #2879 also has a workaround (a drop-in that disables QPH2); read the thread first. |
+| **stuck** | The charger chip is in QPH2 with no input: `Input OK: 0` with `IMP Trigger: 1` (or `QPH2: 1`) in `status_detailed`, or `QPH(2)` / `QPH2 Entered` with under 0.10 A in the daemon log. This is the #2879 bug. | Reseat the cable or switch chargers. #2879 also has a workaround (a drop-in that disables QPH2); read the thread first. Don't leave it on that charger, on or off. |
 | **no-input** | Plugged in, but under 0.05 A comes in, or the charger chip refuses the input (`Input OK: 0` without QPH2). #2879 reports this with some power banks, and on stuck units that show `QPH(1) - Sel: AICL`. | Try a wall charger, or another cable. |
 | **cant-keep-up** | Current is coming in, but the battery gauge shows it losing charge anyway. | Use a stronger charger (PD, 9 V or more) or a better cable. |
 | **discharge** | The battery gauge shows it losing charge while plugged in, cause unknown. | Reseat, then switch chargers. |

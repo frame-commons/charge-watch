@@ -152,6 +152,54 @@ class Rules(unittest.TestCase):
     def test_status_detailed_stuck(self):
         self.assertIn("stuck", self._sys(4, detail={"Input OK": 0, "IMP Trigger": 1, "QPH2": 1}, bat_cur=-0.9))
 
+    def test_status_detailed_stuck_without_a_qph2_field(self):
+        """#2879's confirmed sign on QPH2 entry is IMP Trigger 1 with Input OK 0; some drivers print no QPH2 line."""
+        act = self._sys(4, detail={"Input OK": 0, "IMP Trigger": 1}, bat_cur=-0.4)
+        self.assertIn("stuck", act); self.assertNotIn("no-input", act)
+
+    def test_stuck_from_the_two_commands_in_2879(self):
+        """The shape of the check #2879 asks testers to run: `journalctl -t deckard_charge_daemon | grep -E
+        "QPH2|AICL"` and `cat .../pm8550b-charger/status_detailed`. Values are made up; the field names and log
+        lines are the ones reported there."""
+        root = tempfile.mkdtemp()
+        fx.headset(root, soc=12, bat_ua=-400_000)
+        ps = os.path.join(root, "sys/class/power_supply")
+        os.rename(os.path.join(ps, "pm0000-charger"), os.path.join(ps, "pm8550b-charger"))
+        with open(os.path.join(ps, "pm8550b-charger/status_detailed"), "w") as f:
+            f.write("USB: 1\nInput OK: 0\nIMP Trigger: 1\nUSB UV: 0   USB OV: 0   USB Suspend: 0\n"
+                    "Buck OK: 1  BATT OK: 1  CHG Ctrl OK: 1\n")
+        s = cw.read_sysfs(ps, run_dir=os.path.join(root, "run/deckardcharger"))
+        self.assertEqual((s["detail"]["Input OK"], s["detail"]["IMP Trigger"]), (0, 1))
+        self.assertTrue(cw.qph2_stuck(s["detail"]))
+        lines = ["Triggering AICL", "QPH2 AICL Timeout, Trying anyway", "QPH2 Entered",
+                 "USB(1) - V: 15.1, Neg: 15.0;  Cur: -0.02, Neg:  3.0;  Type: C PD [PD_PPS]",
+                 "FG INT - V: 7.400;            Cur: -0.40;             SOC:  12 %"]
+        got = list(cw.samples_from_lines([(1.0, l) for l in lines]))
+        self.assertEqual(len(got), 1); self.assertEqual(got[0]["qph"], 2)
+        rules, act = cw.Rules(hold=60), []
+        for i in range(5):
+            act = rules.step({**got[0], "t": 1000 + 20 * i})
+        self.assertIn("stuck", act)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("\n".join(["QPH(1) - Sel: AICL; Load: 0x0", "wifi: roamed"] + lines) + "\n")
+        kept = [l for _, l in cw.load_saved(f.name)]
+        os.unlink(f.name)
+        self.assertIn("QPH2 Entered", kept); self.assertNotIn("wifi: roamed", kept)
+
+    def test_qph2_timeout_is_not_entry(self):
+        got = list(cw.samples_from_lines([(1.0, "QPH2 Timeout, Exiting"),
+                                          (1.0, "USB(1) - V: 15.1, Neg: 15.0;  Cur: -0.02, Neg:  3.0;  Type: C PD")]))
+        self.assertNotEqual(got[0].get("qph"), 2)
+
+    def test_shutdown_text_never_calls_powered_off_safe(self):
+        """#2879: units left powered off on a stuck charger drained and never came back. The power-off lines must
+        tell you to unplug, and none may say shutting down protects the battery."""
+        for k in ("shutdown-warn", "poweroff"):
+            self.assertNotIn("protect", cw.MESSAGES[k].lower()); self.assertNotIn("protect", cw.SPOKEN[k].lower())
+            self.assertNotIn("protect", cw.TITLES[k].lower())
+        self.assertIn("unplug", cw.MESSAGES["poweroff"].lower())
+        self.assertIn("unplug", cw.TITLES["poweroff"].lower())
+
     def test_power_bank_variant(self):
         act = self._sys(4, detail={"Input OK": 0, "IMP Trigger": 0, "QPH2": 0}, bat_cur=-0.9)
         self.assertIn("no-input", act); self.assertNotIn("stuck", act)

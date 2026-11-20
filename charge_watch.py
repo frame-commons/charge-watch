@@ -23,7 +23,8 @@ Sources, best first (field names from SteamOS issue #2879):
 
 Warnings. Each must last its whole hold time, and none fires at 95 % or above or while the battery is hot
 (it pauses charging on purpose when hot):
-  stuck         charger in QPH2 with no input (Input OK 0 + QPH2 1, or QPH(2) with < 0.10 A in): the #2879 bug
+  stuck         charger in QPH2 with no input (Input OK 0 + IMP Trigger 1 or QPH2 1, or QPH(2) / "QPH2 Entered"
+                with < 0.10 A in): the #2879 bug
   no-input      plugged in, but under 0.05 A comes in, or Input OK 0 without QPH2 (the power-bank variant)
   cant-keep-up  the gauge shows the battery losing charge while real current comes in: charger too weak
   discharge     the gauge shows the battery losing charge while plugged in, cause unknown
@@ -35,8 +36,9 @@ unmuted) for the alarm, then put back. Severe warnings repeat every --repeat s, 
 below. Optional phone push (ntfy, Pushover, Discord, any webhook) is set in ~/.config/charge-watch/config.json.
 
 Optional auto-shutdown (--shutdown-at N, off by default): at N % or below and not charging, plugged in or not, it
-warns, counts down --countdown s, and powers off, unless charging starts first. A dead-flat Frame may never charge
-again (#2879); shutting down early keeps it above that. It cannot help while the headset is asleep.
+warns, counts down --countdown s, and powers off, unless charging starts first. It is a last resort, not protection:
+#2879 has units that drained while powered off on a stuck charger and never came back. After it shuts down, unplug
+it and charge it on a charger that works. It cannot help while the headset is asleep.
 
 Blind spots: it runs only while the headset is awake. Asleep (charging by firmware) and powered off it cannot
 watch or warn, and #2879 has units that died in exactly those states.
@@ -55,6 +57,7 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~
 NUM = r"(-?\d+(?:\.\d+)?)"
 PATTERNS = {
     "qph": re.compile(r"QPH\((\d+)\)"),
+    "entered": re.compile(r"\bQPH2 Entered\b"),        # logged on entry to QPH2, after its QPH(2) line (#2879)
     "usb": re.compile(r"USB\((\d+)\) - V:\s*" + NUM + r",\s*Neg:\s*" + NUM + r";\s*Cur:\s*" + NUM + r",\s*Neg:\s*" + NUM),
     "fg": re.compile(r"FG INT - V:\s*" + NUM + r";\s*Cur:\s*" + NUM + r";\s*SOC:\s*(\d+)\s*%"),
     "chg": re.compile(r"CHG\((\d+)\) - V:\s*" + NUM + r".*?Cur:\s*" + NUM + r".*?Stat:\s*([A-Za-z][A-Za-z ]*?)\s*$"),
@@ -105,6 +108,8 @@ class BlockParser:
         c = self.cur
         if "qph" in got:
             c["qph"] = int(got["qph"].group(1))
+        if "entered" in got:
+            c["qph"] = 2
         if "usb" in got:
             m = got["usb"]
             c.update(usb_online=int(m.group(1)), usb_v=float(m.group(2)), usb_neg_v=float(m.group(3)),
@@ -162,6 +167,13 @@ DETAIL = re.compile(r"([A-Z][A-Za-z0-9 _]*?):\s*(-?\d+)")
 def parse_detail(text):
     """The charger chip's `status_detailed`: 'Name: value' pairs, one or several per line -> {name: int}."""
     return {k.strip(): int(v) for k, v in DETAIL.findall(text or "")}
+
+
+def qph2_stuck(detail):
+    """The #2879 bug in the charger chip's status_detailed: no input accepted (Input OK 0) together with the
+    impedance trigger QPH2 entry sets (IMP Trigger 1), or a QPH2 field of 1 where the driver shows one. Input OK 0
+    with both at 0 is the separate power-bank case (no-input)."""
+    return bool(detail) and detail.get("Input OK") == 0 and (detail.get("IMP Trigger") == 1 or detail.get("QPH2") == 1)
 
 
 def read_sysfs(root="/sys/class/power_supply", run_dir="/run/deckardcharger", typec=None):
@@ -231,19 +243,19 @@ MESSAGES = {
                 "Reseat the cable, or try another charger or cable.",
     "slow": "Slow charger. Only five volts. The headset may not keep up while in use.",
     "ok": "Charging again.",
-    "shutdown-warn": "Battery low and not charging. Shutting down in {countdown} seconds to protect the battery. "
+    "shutdown-warn": "Battery low and not charging. Shutting down in {countdown} seconds. "
                      "Plug into a charger that works to cancel.",
     "shutdown-cancel": "Charging. Shutdown cancelled.",
     "poweroff-failed": "Could not shut down by itself. The battery is nearly empty: shut the headset down now, "
                        "or plug it into a charger that works.",
-    "poweroff": "Shutting down now to protect the battery. Charge it on a different charger or cable, "
-                "and check the battery is going up.",
+    "poweroff": "Shutting down now. Unplug this charger: the battery can still drain while off. "
+                "Charge it on a different charger, and check the battery goes up.",
 }
 TITLES = {"stuck": "charger stuck, not charging", "no-input": "plugged in, no power coming in",
           "cant-keep-up": "charger can't keep up", "discharge": "discharging while plugged in",
           "draining": "battery dropping while plugged in", "slow": "slow 5 V charger", "ok": "charging again",
           "shutdown-warn": "low battery, shutting down soon", "shutdown-cancel": "shutdown cancelled",
-          "poweroff": "shut down to protect the battery", "poweroff-failed": "could not shut down, do it by hand",
+          "poweroff": "shut down, battery low: unplug it", "poweroff-failed": "could not shut down, do it by hand",
           "test": "test alert"}
 SEVERE = ("stuck", "no-input", "cant-keep-up", "discharge", "draining")  # most specific first
 URGENT = SEVERE + ("shutdown-warn", "poweroff", "poweroff-failed")
@@ -309,7 +321,7 @@ class Rules:
         self.hist = [h for h in self.hist if h[0] >= t - self.o["window"]]
         guard = (soc is None or soc < self.o["full"]) and (s.get("bat_temp") or 0) < self.o["hot"]
         detail, usb_cur, active = s.get("detail") or {}, s.get("usb_cur"), []
-        stuck = (detail.get("Input OK") == 0 and detail.get("QPH2") == 1) or \
+        stuck = qph2_stuck(detail) or \
                 (s.get("qph") == 2 and usb_cur is not None and usb_cur < 0.10)
         if self._held("stuck", guard and stuck, t, self.o["hold"]):
             active.append("stuck")
@@ -501,12 +513,12 @@ def find_player():
 
 # ---------- speech ----------
 # Spoken lines, one per alert kind. The bundled clips in voice/ are these lines, made by tools/make-voice.py with
-# espeak-ng (a rule-based synthesizer: no neural voice, no network). Drop your own <kind>.wav in
+# Kokoro-82M on a PC (synthetic speech, no recording of anyone). Drop your own <kind>.wav in
 # ~/.config/charge-watch/voice/ to replace any of them, your own voice for example.
 SPOKEN = {
     "stuck": MESSAGES["stuck"], "no-input": MESSAGES["no-input"], "cant-keep-up": MESSAGES["cant-keep-up"],
     "discharge": MESSAGES["discharge"], "draining": MESSAGES["draining"], "slow": MESSAGES["slow"], "ok": MESSAGES["ok"],
-    "shutdown-warn": "Battery low and not charging. Shutting down soon to protect the battery. "
+    "shutdown-warn": "Battery low and not charging. Shutting down soon. "
                      "Plug into a charger that works to cancel.",
     "shutdown-cancel": MESSAGES["shutdown-cancel"], "poweroff": MESSAGES["poweroff"],
     "poweroff-failed": MESSAGES["poweroff-failed"], "test": "This is a charge-watch test.",
@@ -777,7 +789,7 @@ def load_saved(path):
                 out.append((int(e.get("__REALTIME_TIMESTAMP", "0")) / 1e6, message_text(e["MESSAGE"])))
             elif "line" in e:
                 out.append((float(e.get("t", i)), e["line"]))
-    keys = (HEADER, "QPH(", "USB(", "FG INT", "CHG(")
+    keys = (HEADER, "QPH(", "QPH2 Entered", "USB(", "FG INT", "CHG(")
     return [x for x in out if any(k in x[1] for k in keys)]
 
 
@@ -980,8 +992,8 @@ FINDINGS = {
         "While the headset is awake, nothing on its USB-C side reacts to the charger: no USB power, no USB-C "
         "partner, no power agreement. Asleep, the battery went up. So the charger and cable work, and the "
         "headset's USB-C power detection fails only while the system runs. Charge it asleep or off for now. "
-        "charge-watch's auto-shutdown (\"shutdown_at\" in its settings) turns it off before it runs flat, "
-        "and then it charges."),
+        "charge-watch's auto-shutdown (\"shutdown_at\" in its settings) turns it off before it runs flat. "
+        "Check the battery % goes up after: #2879 has units that drained while powered off on a charger."),
     "not-detected": (
         "The headset doesn't see the charger at all",
         "With the charger plugged in, nothing on the headset's USB-C side reacts: no USB power, no USB-C "
@@ -991,7 +1003,8 @@ FINDINGS = {
         "The charger chip is stuck (the QPH2 bug, SteamOS issue #2879)",
         "The headset agreed power with the charger, but its charger chip went into its QPH2 mode and stopped "
         "taking input. Reseat the cable or switch chargers. #2879 has a workaround (a root change: read the "
-        "thread first)."),
+        "thread first). Don't let it reach 0 %, and don't leave it powered off on that charger: units in "
+        "#2879 drained that way and never came back. Unplug it."),
     "input-refused": (
         "The headset sees the charger but refuses its power",
         "The charger chip reports no usable input, without the QPH2 state. #2879 reports this with some power "
@@ -1030,7 +1043,7 @@ def diagnose(steps, user_plugged=None, sleep=None):
     plugged_now = user_plugged if user_plugged is not None else seen(last)
     if not plugged_now:
         return "unplugged"
-    if any(f["detail"].get("Input OK") == 0 and f["detail"].get("QPH2") == 1 for f in allf):
+    if any(qph2_stuck(f["detail"]) for f in allf):
         return "qph2-stuck"
     replug = [f for label, f in steps if label.startswith("plugged")] or [last]
     if user_plugged and not any(seen(f) for f in replug):
@@ -1092,7 +1105,7 @@ def valve_text(pattern, info, f0, steps, sleep, charger):
                                            "asleep or off.",
         "not-detected": "With the charger plugged in, the headset does not detect it at all: no USB power, no "
                         "USB-C partner, no PD contract.",
-        "qph2-stuck": "The charger chip enters QPH2 and stops taking input (status_detailed: Input OK 0, QPH2 1), "
+        "qph2-stuck": "The charger chip enters QPH2 and stops taking input (status_detailed: Input OK 0 with IMP Trigger 1), "
                       "so the battery drains while plugged in. This matches SteamOS issue #2879.",
         "input-refused": "The headset sees the charger, but the charger chip reports no usable input "
                          "(status_detailed: Input OK 0).",
