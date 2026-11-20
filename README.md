@@ -113,6 +113,8 @@ A warning is pushed when it starts, then at most every 10 minutes while it lasts
 | **draining** | Backstop: the battery % itself fell 2 points within 10 minutes while plugged in. | Same. |
 | **slow** | The charger only offers 5 V. Said once per plug-in; the headset may still charge, just slowly. | Fine when idle; use a PD charger when playing. |
 
+Not a fault: a full or charge-limited battery takes almost no current. While the charger chip reads `Input OK: 1` and `CV: 1` (holding the battery at its target voltage), low input current alone raises neither **stuck** nor **no-input**; the battery-gauge warnings still apply. A healthy unit on Valve's 45 W charger logs `QPH2 AICL Timeout`, `QPH2 Entered` and then `Exiting QPH2 - Low Current and No Load` ([#2879](https://github.com/ValveSoftware/SteamOS/issues/2879#issuecomment-6993898843)); the exit line cancels the entry.
+
 Severe warnings repeat every minute (every 30 s at 15 % or below) until fixed. You hear "Charging again" when a
 warning clears and the battery gauge shows it charging.
 

@@ -6,6 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
 import charge_watch as cw  # noqa: E402
 import fixtures as fx  # noqa: E402
+import real_logs as rl  # noqa: E402
 
 OK = dict(qph=1, cur=1.5, soc=60)
 
@@ -185,6 +186,82 @@ class Rules(unittest.TestCase):
         kept = [l for _, l in cw.load_saved(f.name)]
         os.unlink(f.name)
         self.assertIn("QPH2 Entered", kept); self.assertNotIn("wifi: roamed", kept)
+
+    # ---- real logs from #2879 (tests/real_logs.py) ----
+
+    def _topoff(self, soc, qph=None, usb_cur=0.03, fg_cur=0.0, detail=None, n=8):
+        """Daemon blocks every 20 s with the charger chip's detail merged in, as the live watcher sees them."""
+        detail = detail if detail is not None else cw.parse_detail(rl.HEALTHY_45W_STATUS_DETAILED)
+        rules, act = cw.Rules(), []
+        for i in range(n):
+            s = {"t": 1000 + 20 * i, "src": "daemon", "usb_online": 1, "usb_v": 15.0, "usb_neg_v": 15.0,
+                 "usb_cur": usb_cur, "fg_cur": fg_cur, "soc": soc, "chg_stat": "Charging", "detail": detail}
+            if qph is not None:
+                s["qph"] = qph
+            act = rules.step(s)
+        return act
+
+    def test_healthy_45w_unit_from_2879_is_not_a_fault(self):
+        """KangaBearSkippy's healthy replacement unit, full on Valve's 45 W charger: its log has 'QPH2 AICL
+        Timeout', 'QPH2 Entered' and 'Exiting QPH2 - Low Current and No Load'; status_detailed has Input OK 1,
+        CV 1. None of it may raise a warning."""
+        got = list(cw.samples_from_lines([(rl.secs(t), m) for t, m in rl.HEALTHY_45W_JOURNAL]))
+        self.assertTrue(got)
+        self.assertNotEqual(got[-1].get("qph"), 2)            # it exited QPH2 in the same breath
+        tail = [(rl.secs("08:37:07"), m) for _, m in rl.HEALTHY_45W_JOURNAL[-3:]] + [   # + a status block 1 s on
+            (rl.secs("08:37:08"), "USB(1) - V: 15.0, Neg: 15.0;  Cur:  0.03, Neg:  3.0;  Type: C PD [PD_PPS]"),
+            (rl.secs("08:37:08"), "FG INT - V: 8.780;            Cur:  0.00;             SOC: 100 %")]
+        self.assertNotIn("qph", list(cw.samples_from_lines(tail))[-1])
+        root = tempfile.mkdtemp()
+        fx.headset(root, soc=100, bat_ua=0)
+        ps = os.path.join(root, "sys/class/power_supply")
+        os.rename(os.path.join(ps, "pm0000-charger"), os.path.join(ps, "pm8550b-charger"))
+        with open(os.path.join(ps, "pm8550b-charger/status_detailed"), "w") as f:
+            f.write(rl.HEALTHY_45W_STATUS_DETAILED)
+        s = cw.read_sysfs(ps, run_dir=os.path.join(root, "run/deckardcharger"))
+        self.assertFalse(cw.qph2_stuck(s["detail"])); self.assertTrue(cw.topping_off(s["detail"]))
+        for soc in (100, 94, 85, 70):            # full, or held at a charge limit below the 95 % quiet line
+            for qph in (None, 1, 2):            # even if a block were still read as QPH2
+                self.assertEqual(self._topoff(soc, qph=qph), [], (soc, qph))
+        snap = cw.collect(root)
+        self.assertNotIn(cw.diagnose([("plugged in", cw.facts(snap))], user_plugged=True),
+                         ("qph2-stuck", "input-refused"))
+
+    def test_topping_off_still_warns_when_the_gauge_drains(self):
+        """Input OK 1 + CV 1 only excuses low input current; a battery really losing charge still warns."""
+        self.assertEqual(self._topoff(80, usb_cur=0.03, fg_cur=-0.6), ["discharge"])
+
+    def test_stuck_still_fires_without_the_exit_line(self):
+        """The #2879 bug: QPH2 entered and never left, ~0 A in, Input OK 0 / IMP Trigger 1."""
+        lines = [(rl.secs(t), m) for t, m in rl.HEALTHY_45W_JOURNAL[:-1]] + [
+            (rl.secs("08:37:07"), "USB(1) - V: 15.1, Neg: 15.0;  Cur: -0.02, Neg:  3.0;  Type: C PD [PD_PPS]"),
+            (rl.secs("08:37:07"), "FG INT - V: 7.400;            Cur: -0.40;             SOC:  12 %")]
+        last = list(cw.samples_from_lines(lines))[-1]
+        self.assertEqual(last["qph"], 2)
+        rules, act = cw.Rules(), []
+        for i in range(5):
+            act = rules.step({**last, "t": 1000 + 20 * i})
+        self.assertIn("stuck", act)
+        stuck = {"Input OK": 0, "IMP Trigger": 1, "CV": 1}       # CV 1 never excuses Input OK 0
+        self.assertIn("stuck", self._topoff(40, qph=2, usb_cur=0.0, fg_cur=-0.4, detail=stuck))
+        self.assertIn("stuck", self._topoff(40, qph=2, usb_cur=0.0, fg_cur=-0.4, detail={}))   # no sysfs detail
+        self.assertIn("no-input", self._topoff(40, qph=1, usb_cur=0.0, fg_cur=-0.4, detail={"Input OK": 1, "CV": 0}))
+
+    def test_qph2_with_current_at_full_from_2879_is_quiet(self):
+        """arealjim's last block before that unit died: QPH2, but ~1 A coming in at 100 %. That moment was
+        charging, not the 0 A state, so it must parse as QPH2 and stay quiet (the death came later, unlogged)."""
+        got = list(cw.samples_from_lines([(1.0, l) for l in rl.QPH2_WITH_CURRENT_FULL]))
+        self.assertEqual(len(got), 1)
+        b = got[0]
+        self.assertEqual((b["qph"], b["usb_cur"], b["soc"]), (2, 0.99, 100))
+        rules, act = cw.Rules(), []
+        for i in range(10):
+            act = rules.step({**b, "t": 1000 + 20 * i})
+        self.assertEqual(act, [])
+        rules = cw.Rules()                                   # same current at a lower charge: still not stuck
+        for i in range(10):
+            act = rules.step({**b, "soc": 60, "t": 1000 + 20 * i})
+        self.assertNotIn("stuck", act)
 
     def test_qph2_timeout_is_not_entry(self):
         got = list(cw.samples_from_lines([(1.0, "QPH2 Timeout, Exiting"),

@@ -24,8 +24,10 @@ Sources, best first (field names from SteamOS issue #2879):
 Warnings. Each must last its whole hold time, and none fires at 95 % or above or while the battery is hot
 (it pauses charging on purpose when hot):
   stuck         charger in QPH2 with no input (Input OK 0 + IMP Trigger 1 or QPH2 1, or QPH(2) / "QPH2 Entered"
-                with < 0.10 A in): the #2879 bug
+                with < 0.10 A in): the #2879 bug. "Exiting QPH2" right after entry cancels the entry.
   no-input      plugged in, but under 0.05 A comes in, or Input OK 0 without QPH2 (the power-bank variant)
+  Low current alone counts for neither while the charger chip reads Input OK 1 and CV 1: a full or
+  charge-limited battery topping off (a healthy unit on Valve's 45 W charger, #2879).
   cant-keep-up  the gauge shows the battery losing charge while real current comes in: charger too weak
   discharge     the gauge shows the battery losing charge while plugged in, cause unknown
   draining      backstop: the battery % fell by >= --drop points within --window while plugged in
@@ -58,6 +60,8 @@ NUM = r"(-?\d+(?:\.\d+)?)"
 PATTERNS = {
     "qph": re.compile(r"QPH\((\d+)\)"),
     "entered": re.compile(r"\bQPH2 Entered\b"),        # logged on entry to QPH2, after its QPH(2) line (#2879)
+    "exited": re.compile(r"\bExiting QPH2\b"),        # 'Exiting QPH2 - Low Current and No Load': a healthy, full
+                                                      # unit on Valve's 45 W charger logs it right after entry (#2879)
     "usb": re.compile(r"USB\((\d+)\) - V:\s*" + NUM + r",\s*Neg:\s*" + NUM + r";\s*Cur:\s*" + NUM + r",\s*Neg:\s*" + NUM),
     "fg": re.compile(r"FG INT - V:\s*" + NUM + r";\s*Cur:\s*" + NUM + r";\s*SOC:\s*(\d+)\s*%"),
     "chg": re.compile(r"CHG\((\d+)\) - V:\s*" + NUM + r".*?Cur:\s*" + NUM + r".*?Stat:\s*([A-Za-z][A-Za-z ]*?)\s*$"),
@@ -110,6 +114,8 @@ class BlockParser:
             c["qph"] = int(got["qph"].group(1))
         if "entered" in got:
             c["qph"] = 2
+        if "exited" in got and c.get("qph") == 2:
+            del c["qph"]           # it left QPH2 again: this block no longer says it is in it
         if "usb" in got:
             m = got["usb"]
             c.update(usb_online=int(m.group(1)), usb_v=float(m.group(2)), usb_neg_v=float(m.group(3)),
@@ -174,6 +180,13 @@ def qph2_stuck(detail):
     impedance trigger QPH2 entry sets (IMP Trigger 1), or a QPH2 field of 1 where the driver shows one. Input OK 0
     with both at 0 is the separate power-bank case (no-input)."""
     return bool(detail) and detail.get("Input OK") == 0 and (detail.get("IMP Trigger") == 1 or detail.get("QPH2") == 1)
+
+
+def topping_off(detail):
+    """The charger chip accepts input (Input OK 1) and holds the battery at its target voltage (CV 1): a full or
+    charge-limited battery takes almost no current, which is not a fault. A healthy replacement unit on Valve's 45 W
+    charger shows exactly this at full, with QPH2 lines in its log (#2879, KangaBearSkippy, 2026-11-18)."""
+    return bool(detail) and detail.get("Input OK") == 1 and detail.get("CV") == 1
 
 
 def read_sysfs(root="/sys/class/power_supply", run_dir="/run/deckardcharger", typec=None):
@@ -321,11 +334,13 @@ class Rules:
         self.hist = [h for h in self.hist if h[0] >= t - self.o["window"]]
         guard = (soc is None or soc < self.o["full"]) and (s.get("bat_temp") or 0) < self.o["hot"]
         detail, usb_cur, active = s.get("detail") or {}, s.get("usb_cur"), []
+        low_in_ok = topping_off(detail)     # low input current is expected then; the gauge rules below still count
         stuck = qph2_stuck(detail) or \
-                (s.get("qph") == 2 and usb_cur is not None and usb_cur < 0.10)
+                (not low_in_ok and s.get("qph") == 2 and usb_cur is not None and usb_cur < 0.10)
         if self._held("stuck", guard and stuck, t, self.o["hold"]):
             active.append("stuck")
-        noin = not stuck and (detail.get("Input OK") == 0 or (usb_cur is not None and usb_cur < 0.05))
+        noin = not stuck and (detail.get("Input OK") == 0 or
+                              (not low_in_ok and usb_cur is not None and usb_cur < 0.05))
         if self._held("no-input", guard and noin, t, self.o["hold"]):
             active.append("no-input")
         cur = battery_current(s)
